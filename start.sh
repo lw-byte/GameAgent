@@ -506,11 +506,23 @@ echo "  💡 Press Ctrl+C to stop"
 echo "=============================================="
 
 # Open browser automatically unless a headless caller opts out.
+# On WSL/CI/headless, `command -v open` and `command -v xdg-open` may both
+# succeed even though neither can actually launch anything (no GUI browser,
+# no $DISPLAY). Try each launcher, suppress its stderr so the fallback chain
+# stays silent, and check the real exit code. `wslview` is checked first when
+# available because it forwards the URL to the Windows default browser.
 if [ "${SMARTPERFETTO_NO_OPEN:-0}" != "1" ]; then
-  if command -v open >/dev/null 2>&1; then
-    open "$FRONTEND_URL"
-  elif command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$FRONTEND_URL"
+  browser_opened=0
+  for launcher in wslview xdg-open open; do
+    if command -v "$launcher" >/dev/null 2>&1; then
+      if "$launcher" "$FRONTEND_URL" >/dev/null 2>&1; then
+        browser_opened=1
+        break
+      fi
+    fi
+  done
+  if [ "$browser_opened" = "0" ]; then
+    echo "💡 No working browser detected; open ${FRONTEND_URL} manually in your web browser."
   fi
 fi
 
