@@ -239,6 +239,31 @@ the primary. Release tags follow `vX.Y.Z` format.
 When cutting a release, update `backend/package.json`, then [CHANGELOG.md](CHANGELOG.md),
 then the root `package.json` to match, in that order.
 
+## Line Endings
+
+The repository's canonical line ending is LF for every tracked text file. This is
+enforced by three layers, in order of precedence:
+
+1. **Git** — root [`.gitattributes`](.gitattributes) declares
+   `* text=auto eol=lf` so every committed text blob is LF.
+2. **Editors** — root [`.editorconfig`](.editorconfig) sets `end_of_line = lf`,
+   so most editors stop re-introducing CRLF on save.
+3. **CI** — `npm run check:line-endings` (driven by `scripts/check-line-endings.mjs`)
+   runs in both `quality` and `verify:pr`, so a CRLF regression fails the gate
+   before any other check.
+
+Prebuilt `frontend/v*/**` and `report-sample/**` are marked `linguist-generated
+-diff -merge` so they are not mass-edited; they are re-emitted by
+[`./scripts/update-frontend.sh`](scripts/update-frontend.sh). Contributors on
+Windows do not need to change their local `core.autocrlf`; the `.git
+attributes` rule wins at commit time.
+
+If you need to normalize an existing file, run:
+
+```bash
+npm run fix:line-endings
+```
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the [GNU Affero General Public License v3.0](LICENSE).

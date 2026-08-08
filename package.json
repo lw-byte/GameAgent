@@ -12,6 +12,8 @@
     "format:check": "biome check --formatter-enabled=true --linter-enabled=false --assist-enabled=false package.json backend/package.json biome.json knip.json",
     "deadcode": "knip --dependencies --max-show-issues 50 --no-config-hints",
     "shellcheck": "shellcheck -x start.sh scripts/*.sh",
+    "check:line-endings": "node scripts/check-line-endings.mjs",
+    "fix:line-endings": "node scripts/check-line-endings.mjs --write",
     "check:frontend-prebuild": "node scripts/check-frontend-prebuild.cjs",
     "test:node-env": "bash scripts/test-node-env.sh",
     "test:governance": "node --test scripts/__tests__/check-perfetto-skills-impact.test.mjs scripts/__tests__/process-harness.test.mjs scripts/__tests__/service-lifecycle.test.mjs scripts/__tests__/startup-contracts.test.mjs scripts/__tests__/frontend-server-health.test.mjs scripts/__tests__/ensure-trace-processor.test.mjs scripts/__tests__/runtime-distribution-assets.test.mjs scripts/__tests__/release-portable.test.mjs scripts/__tests__/portable-release-smoke-workflow.test.mjs scripts/__tests__/verify-portable-package-safety.test.mjs scripts/__tests__/smoke-portable-archive.test.mjs scripts/__tests__/verify-portable-smoke-evidence.test.mjs scripts/__tests__/native-runtime-compat.test.mjs scripts/__tests__/dual-trace-e2e-services.test.mjs scripts/__tests__/verify-docs.test.mjs scripts/__tests__/find-macho-files.test.mjs scripts/__tests__/i18n-heading-contract.test.mjs",
@@ -43,8 +45,8 @@
     "trace-processor:sync-prebuilts": "node scripts/sync-trace-processor-prebuilts.cjs",
     "release:portable": "bash ./scripts/release-portable.sh",
     "release:windows-exe": "bash ./scripts/release-windows-exe.sh",
-    "quality": "npm run lint && npm run format:check && npm run deadcode && npm run shellcheck",
-    "verify:pr": "npm run test:governance && npm run verify:docs && npm run verify:i18n && npm run verify:rendering-pipelines && npm run quality && npm run check:frontend-prebuild && npm run rust:verify && npm --prefix backend run verify:pr"
+    "quality": "npm run check:line-endings && npm run lint && npm run format:check && npm run deadcode && npm run shellcheck",
+    "verify:pr": "npm run check:line-endings && npm run test:governance && npm run verify:docs && npm run verify:i18n && npm run verify:rendering-pipelines && npm run quality && npm run check:frontend-prebuild && npm run rust:verify && npm --prefix backend run verify:pr"
   },
   "engines": {
     "node": ">=24.0.0 <25.0.0"

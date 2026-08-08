@@ -1,2 +1,13 @@
+# Canonical line ending is LF for all tracked text files.
+# See .editorconfig and scripts/check-line-endings.mjs.
+* text=auto eol=lf
+
+# Prebuilt / generated tracked assets — never mass-edited; the next
+# `./scripts/update-frontend.sh` re-emits them.
+frontend/v*/** linguist-generated -diff -merge
+report-sample/** linguist-generated -diff -merge
+
+# Trace processor prebuilts are platform binaries; keep the explicit
+# binary contract from day one.
 backend/prebuilts/trace_processor/*/trace_processor_shell binary
 backend/prebuilts/trace_processor/*/trace_processor_shell.exe binary

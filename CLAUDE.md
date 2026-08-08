@@ -75,6 +75,11 @@ cd backend && npm run build
 - Before publish, package, tag, npm, Docker, or portable release work, read
   `.claude/rules/release.md` plus `.claude/rules/git.md` and
   `.claude/rules/testing.md`.
+- The repository's canonical line ending is LF. Do not introduce CRLF.
+  `.gitattributes` (`* text=auto eol=lf`) and `.editorconfig`
+  (`end_of_line = lf`) enforce this; prebuilt `frontend/v*/**` and
+  `report-sample/**` are `linguist-generated` and excluded. Run
+  `npm run check:line-endings` before pushing.
 
 ## Independent Review Gate
 
