@@ -3,7 +3,7 @@
 
 ---
 scene: game
-priority: 4
+priority: 1
 effort: medium
 required_capabilities:
   - cpu_scheduling
