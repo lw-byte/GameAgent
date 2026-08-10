@@ -14,13 +14,13 @@ POST /api/agent/v1/analyze
   → AgentAnalyzeSessionService.prepareSession()  (backend/src/assistant/application/...)
   → createAgentOrchestrator()                    (backend/src/agentRuntime/runtimeSelection.ts)
   → ClaudeRuntime.analyze(query, sessionId, traceId, options)
-       1. classifyScene(query)                   ← ② 场景检测
-       2. detectFocusApps(...) 并行启动          ← ① 焦点应用检测
-       3. classifyQueryComplexity(...) 并行启动  ← query 复杂度分类(quick/full)
+       1. classifyScene(query)                   ← ② 场景检测 (§1.2,  同步 < 1ms)
+       2. detectFocusApps(...) 并行启动          ← ① 焦点应用检测 (§1.1,  后台 Promise)
+       3. classifyQueryComplexity(...) 并行启动  ← ④ query 复杂度分类(quick/full, §1.4)
        4. buildSystemPromptParts(...)            ← ③ game.strategy.md 注入
        5. Claude Agent SDK 主循环:多轮调用
             - submit_plan   (plan/contract 守门)
-            - detect_architecture
+            - detect_architecture              ← ⑤ 架构检测 (§1.3,  第一次 MCP 调用)
             - invoke_skill(game_fps_analysis)
             - invoke_skill(game_main_loop_jank)
             - execute_sql / fetch_artifact
@@ -28,13 +28,30 @@ POST /api/agent/v1/analyze
        6. finalizeAnalysis(): 证据收集 → verifier → 结论 → SSE → 前端
 ```
 
-下面四个章节按用户提出的顺序展开。
+下面五个章节按用户提出的顺序展开。
 
 ---
 
-## 1. 前台焦点应用检测 + 场景检测原理
+## 1. Phase-0 检测器:焦点 / 场景 / 架构 / 复杂度
 
 ### 1.1 焦点应用检测 `detectFocusApps`
+
+#### 1.1.0 焦点检测在管线中的角色
+
+focus app 是 agent 在 SQL 层"我是谁"的锚 — 没有它,所有 `android_battery_stats_event_slices` / `process_counter_track` / `gpu_slice` 查询都需要 caller 先告诉 agent "是哪一款应用",而用户 query 里出现的包名可能含错别字或简写,直接当 SQL 参数会查不到东西。
+
+`detectFocusApps` 的返回值会注入到以下下游:
+
+| 下游 | 用途 |
+|---|---|
+| `buildSystemPromptParts` Tier 2(`focus_apps` 段) | 让 Claude 在看到 SQL 时知道"主分析对象是 com.X,其他包是噪声",避免误把 system_server 的 slice 当成游戏的 |
+| MCP `package` 参数默认值 | `invoke_skill(..., { package: '...' })` 不传 package 时,`skillExecutor` 从 focus.primaryApp 兜底注入 |
+| quick 路径的 `quickFocusAppPreEvidence` | quick 模式下直接用 focus 结果回答"当前是哪个 app"类查询,不再调 skill;若 `quickSkipFocusDetection = true`,整个 focus detection 都被 cancel |
+| `analysis-result snapshot`(`primaryApp` 字段) | 持久化后用于后续 run 对比、报告生成、复查 |
+
+**三级 fallback 的设计逻辑**:`battery_stats` 最准但最稀有(很多 trace 不开电池统计);`oom_adj` 较常见;`frame_timeline` 几乎必有 — 任何 trace 都能拿到一个合理结果,最坏情况返回 `method: 'none'` 让上层决定下一步。
+
+下面展开具体的三级 SQL 实现。
 
 入口:`backend/src/agentv3/focusAppDetector.ts:131-298`,函数 `detectFocusApps(traceProcessorService, traceId, options)`。
 
@@ -126,6 +143,22 @@ for each scene (按 priority 升序):
 
 ### 1.3 架构检测 `detectArchitecture`
 
+#### 1.3.0 架构检测在管线中的角色
+
+`detectArchitecture` 决定 agent 走 24 种细粒度渲染管线中的哪一种 — STANDARD / FLUTTER / COMPOSE / WEBVIEW / 等。这一步的结果驱动 agent 的整个下游行为:
+
+| 下游 | 用途 |
+|---|---|
+| `buildSystemPromptParts` Tier 2(`architecture` 段) | 把 `{ type, confidence, evidence[] }` 注入 prompt,让 Claude 看到"当前是 FLUTTER + IMPELLER + TextureView"等结构化信号 |
+| `submit_plan` plan 守门 | `game.strategy.md` 的 `plan_template` 在 plan 阶段声明 `architecture: FLUTTER` 时,会强制 `engine_loop_jank` 等 FLUTTER 专用 phase 列入 expected_calls |
+| `rendering_pipeline_detection` skill 的 `subvariants` 输出 | FLUTTER 区分 IMPELLER/SKIA + SurfaceView/TextureView;WEBVIEW 区分 X5/Chromium + 各种 surface 模式;COMPOSE 检测 recomposition 与 lazy list |
+| `analysis-result snapshot`(`architecture` 字段) | 持久化后用于后续跨 run 对比 / 报告徽章 / 架构回归 |
+| MCP `architecture_detected` SSE 事件 | 前端在 chat header 渲染架构徽章;事件早于 `conclusion`,agent 已经"知道自己是什么 app" |
+
+**单一实现路径**(与 focus 检测的多 Tier 不同):`detectArchitecture` 只有一条路径 — 调 `rendering_pipeline_detection` YAML skill,失败 fallback 到 `STANDARD` + 置信度 0.5。这避免了"3 种架构 detector 互相打架"导致结果不一致的问题。
+
+下面展开具体实现。
+
 虽然不在"focus/scene"分类,但**入口链路相邻**——`invoke_skill('detect_architecture')` 跑的是同一个 YAML skill `rendering_pipeline_detection`,在 claudeRuntime 中作为 pre-evidence / 首次工具调用出现。
 
 入口:`backend/src/agent/detectors/architectureDetector.ts:53-99`(`detectArchitectureViaSkill`)。
@@ -135,6 +168,101 @@ for each scene (按 priority 升序):
 `resolvePipelineArchitectureType(pipelineId)`(`architectureDetector.ts:41-43`)从 `pipelineSkillLoader.getPipelineCatalogEntry(pipelineId)?.architecture_type` 拿到 24 种细粒度架构之一(STANDARD / FLUTTER / COMPOSE / WEBVIEW / 等)。
 
 本次 session log 看到 `architecture_detected` 在焦点检测之后、`engine initialized` 之前,说明这是 orchestrator 在初始化完后第一波工具调用之一。
+
+---
+
+### 1.4 query 复杂度分类 `classifyQueryComplexity`
+
+入口:`backend/src/agentv3/queryComplexityClassifier.ts:276`,函数 `classifyQueryComplexity(input, config?)`。
+
+#### 1.4.1 它在做什么
+
+把 query 路由到两条 pipeline 之一:`quick`(轻量、直接给答案,无需 verifier)或 `full`(完整 plan + skill + verifier + claim verification)。在 `claudeRuntime.ts:1095-1115` 与 `detectFocusApps` 并行启动,**先于** `buildSystemPromptParts` 完成,以便后续阶段使用结果决定是否走 quick pre-evidence 提前出口。
+
+**返回结构**:`{ complexity: 'quick' | 'full', reason: string, source: 'hard_rule' | 'ai' }`。`source` 标记结果来自本地 hard_rule 还是 AI 分类,便于回放日志和 A/B 评估。
+
+#### 1.4.2 两阶段判定
+
+```text
+classifyQueryComplexity(input, config)
+  ├─ classifyQueryComplexityLocal(input)                  ← 同步,0 网络
+  │    ├─ applyAcknowledgementRule       (query.length < 20)
+  │    │     "谢谢" / "ok" / "got it" / "明白了" → quick
+  │    ├─ applyScopeHardRules            hasReferenceTrace=true → full
+  │    │     (对比模式不可 quick,因为需要 reference trace 的 SQL 关联)
+  │    ├─ applyIdentityFactRule          "包名是什么"/"package name"
+  │    │     + 排除 DIAGNOSTIC_SCOPE  → quick
+  │    ├─ applyTraceFactRule             "有没有帧率"/"多少帧"/"CPU 几核" 类
+  │    │     + 排除 DEEP_DIAGNOSTIC_INTENT → quick
+  │    └─ applyScrollingTriageRule       shouldUseQuickScrollingTriageIntent → quick
+  │
+  └─ classifyWithHaiku(input, lightModel, timeoutMs)      ← fallback,~1-2s
+       └─ Claude Agent SDK sdkQuery({ prompt, options })
+            prompt = buildComplexityClassifierPrompt(input) ← prompt-complexity-classifier.template.md
+            model  = config.lightModel ?? 'claude-haiku-4-5'
+            maxTurns = 1, tools = []
+            timeoutMs ?? = 30_000
+       └─ 解析返回 JSON { complexity, reason }
+       └─ 失败/超时 → graceful degradation → complexity: 'full'
+```
+
+**本地规则先行**(hard_rule 永远比 AI 准):`classifyQueryComplexityLocal` 返回非 null 时直接采用,**不调用 Haiku**(省去 1-2s + 网络 + token 成本)。**只有本地全空**才进 AI 阶段。每个 hard_rule 命中都会 `console.log` reason,便于回放调试分类行为。
+
+#### 1.4.3 runtime 中的 quick / full 行为差异
+
+`claudeRuntime.ts:1095-1115`(`explicitMode = 'fast' | 'full'` 时短路本地分类器)的关键消费点:
+
+| 维度 | `quick` | `full` |
+|---|---|---|
+| plan 守门 | 跳过 `submit_plan`,直接走 pre-evidence 路径 | 走 `submit_plan`,按 mandatory_aspects 校验 |
+| skill 调用 | 命中 `quickXxxPreEvidence`(`focusApp` / `processIdentity` / `traceFact` / `scrollingTriage`)时直接返回结论,不再调 MCP skill | 调 `invoke_skill` 系列(`game_fps_analysis` / `game_main_loop_jank` / ...) |
+| focus detection | `quickSkipFocusDetection = true` 时整个 `detectFocusApps` cancel(避免 30s 耗时) | 等 focus 跑完 |
+| verifier | 不跑 `verifyFinalResult` / `claimVerificationRunner` | 跑完整 claim 验证 + identity resolution |
+| snapshot | 只写 quick 摘要 | 写完整 analysis-result snapshot(含 evidence + claim 状态) |
+
+**graceful degradation**:Haiku 失败/超时 → 退化为 `full`(宁可慢一点也别给错答案,因为 quick 路径可能直接放行,不做 verifier)。
+
+#### 1.4.4 本次 query 的预期命中链路
+
+`"分析sgame游戏应用的卡顿问题"`:
+
+```text
+length = 16 (< 20) → 进 acknowledgement rule 候选
+  ↓ 但 query 含 "分析"/"卡顿" → 不算纯确认 → 拒
+applyScopeHardRules: 无 referenceTrace → null
+applyIdentityFactRule: 不命中 IDENTITY_FACT_PATTERNS + DIAGNOSTIC_SCOPE 命中 → null
+applyTraceFactRule: DEEP_DIAGNOSTIC_INTENT_PATTERNS("分析"/"卡顿")命中 → null
+applyScrollingTriageRule: 不是滑动 → null
+本地全空 → 调 Haiku
+  ↓ Haiku 看 prompt: "分析 X 应用 + 卡顿" = 多步诊断
+  ↓ 返回 { complexity: 'full', reason: 'multi-step game jank diagnosis' }
+```
+
+#### 1.4.5 为什么需要它
+
+`★ Insight ─────────────────────────────────────`
+- **成本**:quick 路径省掉 plan 守门 + verifier + 多 skill 调用的几秒到几十秒;Haiku 本地路径省掉 SDK 启动 1-2s。
+- **正确性**:`"这个 trace 的应用包名"` 这种纯事实查询如果走 full 路径,agent 也会先调一堆 skill 才出答案 — 既慢又显得啰嗦,用户会怀疑 agent 在打太极。
+- **可比性**:`reason` 字段是结构化字符串(`'trace identity fact lookup'` / `'comparison mode'` / `'multi-step game jank diagnosis'`),可作为回放日志的强信号做分类质量分析。
+- **失败兜底**:Haiku 失败不是错误而是 degradation,默认 full 保证 agent 至少能完成诊断 — quick 路径的"直接放行"特性让它对分类错误零容忍,所以失败时反而要保守。
+- **explicitMode 短路**:`options.analysisMode = 'fast' | 'full'` 会跳过整个 classifier,直接 `complexity = explicitMode` —— 用户在前端选了"快速分析"时连本地规则都不跑,这是尊重用户显式选择。
+`─────────────────────────────────────────────────`
+
+#### 1.4.6 与 focus / scene / arch 检测的关系
+
+四个 Phase-0 检测器在 `claudeRuntime.ts:1066-1130` 并行启动,但**职责不重叠**:
+
+```text
+Phase 0 (并行启动, ~0-30s):
+  ├─ classifyScene         → 'game'           (§1.2,  同步 < 1ms)
+  ├─ detectFocusApps       → primaryApp       (§1.1,  后台 Promise, ~30s)
+  ├─ classifyQueryComplexity → 'quick'|'full' (§1.4,  本地即返 + 后台 Haiku)
+  └─ detectArchitecture    → FLUTTER|...      (§1.3,  后台 Promise, agent 调时跑)
+```
+
+四者结果在 `buildSystemPromptParts`(`claudeSystemPrompt.ts:591-`)的不同 Tier 出现:Tier 2(per-trace stable)放 architecture + focus_apps,Tier 3(per-query)放 scene_strategy + complexity 派生的工具白名单。如果 classifier 决定 `quick`,Claude 看到的 tool registry 是缩简版,不能调 verifier。
+
+---
 
 ---
 
@@ -669,6 +797,11 @@ T+~120s     analysis_completed 事件 + snapshot 持久化
 | 新增引擎(比如新增 "Egret" 引擎) | `game_main_loop_jank.skill.yaml` 的 GLOB 模式 + CASE WHEN |
 | 让游戏场景快 1 秒 | 改 `backend/.env` 的 `CLAUDE_LIGHT_MODEL`(详见本文档外的前置讨论) |
 | 让 focus 检测优先游戏包名 | 改 `focusAppDetector.ts` Tier 3 的排序(用 query 内出现的包名加权) |
+| 把某类 query 强制走 quick | `queryComplexityClassifier.ts` 的 `applyXxxRule` 加 hard_rule(本地规则永远比 Haiku 准) |
+| 把某类 query 强制走 full | 同上,或 `applyScopeHardRules` 加 hasReferenceTrace 类似条件 |
+| 调整 complexity classifier 的 prompt | `backend/strategies/prompt-complexity-classifier.template.md` + 重跑 `validate:strategies` |
+| 给 quick 模式开放更多 skill | `claudeRuntime.ts` 的 quick 路径 skill 白名单;注意 quick 不跑 verifier,放过要谨慎 |
+| 给架构检测加新架构类型 | `pipelineSkillLoader` 的 catalog + `rendering_pipeline_detection` YAML skill 的 `determine_pipeline` step |
 
 ---
 
@@ -681,7 +814,7 @@ T+~120s     analysis_completed 事件 + snapshot 持久化
 | ClaudeRuntime 入口 | `backend/src/agentRuntime/engines/claude/claudeRuntime.ts` | 1031 (`analyze`) |
 | 场景检测 | `backend/src/agentv3/sceneClassifier.ts` | 103 (`classifyScene`) |
 | 焦点应用检测 | `backend/src/agentv3/focusAppDetector.ts` | 131 (`detectFocusApps`) |
-| 复杂度分类 | `backend/src/agentv3/queryComplexityClassifier.ts` | 276 (`classifyQueryComplexity`) |
+| 复杂度分类 | `backend/src/agentv3/queryComplexityClassifier.ts` | 231 (`classifyQueryComplexityLocal`), 276 (`classifyQueryComplexity`), 595 (`classifyWithHaiku`) |
 | 策略加载 | `backend/src/agentv3/strategyLoader.ts` | 363 (parseStrategyFile), 601 (baseStrategies) |
 | System prompt 拼装 | `backend/src/agentv3/claudeSystemPrompt.ts` | 149 (sceneStrategySections), 591 (buildSystemPromptParts) |
 | MCP server | `backend/src/agentv3/claudeMcpServer.ts` | 3053 (`invoke_skill`), 2763 (`execute_sql`), 3555 (`detect_architecture`), 5215 (`submit_plan`) |
@@ -700,4 +833,4 @@ T+~120s     analysis_completed 事件 + snapshot 持久化
 
 ## 7. 一句话总结
 
-> SmartPerfetto 的"分析sgame游戏卡顿"执行链:**HTTP → ClaudeRuntime.analyze()** 在 `claudeRuntime.ts:1031` 同步启动 **3 件并行事**(焦点检测、复杂度分类、system prompt 拼装),**场景检测 0 延迟** 通过 `sceneClassifier.ts:103` 命中 `game`,**game strategy 正文** 通过 `claudeSystemPrompt.ts:149` 注入 prompt,agent 在 plan 守门(`game.strategy.md:48-62` 的 `fps_and_gpu` + `engine_loop_jank`)通过后,**`invoke_skill('game_fps_analysis')` 与 `invoke_skill('game_main_loop_jank')`** 通过 MCP `claudeMcpServer.ts:3053` 路由到 `skillExecutor.ts:2964` 的 atomic step,后者调用 `traceProcessorService.ts:549` 把 SQL POST 给 `trace_processor_shell`,拿回 DataEnvelope → 回到模型 → 收集证据 → `claimVerificationRunner` 验证 → SSE `conclusion` + `analysis_completed` 推到前端,全程多副本落入 session log / report / snapshot。
+> SmartPerfetto 的"分析sgame游戏卡顿"执行链:**HTTP → ClaudeRuntime.analyze()** 在 `claudeRuntime.ts:1031` 同步启动 **4 件 Phase-0 并行事**(焦点检测 / 复杂度分类 / 场景检测 / 架构检测),其中**场景检测 0 延迟** 通过 `sceneClassifier.ts:103` 命中 `game`,**复杂度分类** 通过 `queryComplexityClassifier.ts:276` 的本地 hard_rule + Haiku fallback 决定走 quick / full,焦点与架构在后台 Promise 异步跑,**game strategy 正文** 通过 `claudeSystemPrompt.ts:149` 注入 prompt,agent 在 plan 守门(`game.strategy.md:48-62` 的 `fps_and_gpu` + `engine_loop_jank`)通过后,**`invoke_skill('game_fps_analysis')` 与 `invoke_skill('game_main_loop_jank')`** 通过 MCP `claudeMcpServer.ts:3053` 路由到 `skillExecutor.ts:2964` 的 atomic step,后者调用 `traceProcessorService.ts:549` 把 SQL POST 给 `trace_processor_shell`,拿回 DataEnvelope → 回到模型 → 收集证据 → `claimVerificationRunner` 验证 → SSE `conclusion` + `analysis_completed` 推到前端,全程多副本落入 session log / report / snapshot。
