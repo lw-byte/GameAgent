@@ -109,7 +109,7 @@ import {
 import {projectToolResultForExternalSurface} from '../../../services/rag/toolResultProjectionFilter';
 import {completeFinalReportCodeReferences} from '../../../services/codebase/codeReferenceContract';
 import {extractSourceLookupCodeReferences} from '../../../services/codebase/sourceLookupTools';
-import {diagnosticLogIdentity} from '../../../utils/logger';
+import {diagnosticLogIdentity, logger} from '../../../utils/logger';
 import { runSnapshots } from '../../../agentv3/selfImprove/strategyFingerprint';
 import { verifyConclusion, generateCorrectionPrompt, isConclusionIncomplete } from './claudeVerifier';
 import {recoverInterruptedFinalReport} from '../../runtimeFinalReportRecovery';
@@ -772,6 +772,24 @@ function sdkQueryWithRetry(
     ? { ...params, options: { ...queryOptions, ...binaryOpt } }
     : params;
 
+  const callStartedAt = Date.now();
+  const callModel = (queryOptions.model as string | undefined) ?? 'unknown';
+  const rawPrompt = mergedParams.prompt;
+  const promptForBytes = typeof rawPrompt === 'string'
+    ? rawPrompt
+    : Array.isArray(rawPrompt)
+      ? JSON.stringify(rawPrompt)
+      : JSON.stringify(rawPrompt ?? '');
+  const callPromptBytes = Buffer.byteLength(promptForBytes, 'utf8');
+  const rawSystemPrompt = queryOptions.systemPrompt;
+  const systemPromptForBytes = typeof rawSystemPrompt === 'string'
+    ? rawSystemPrompt
+    : rawSystemPrompt === undefined
+      ? ''
+      : JSON.stringify(rawSystemPrompt);
+  const callSystemPromptBytes = Buffer.byteLength(systemPromptForBytes, 'utf8');
+  logger.info('LLMCall', `sdkQueryWithRetry: start (model=${callModel}, promptBytes=${callPromptBytes}, systemPromptBytes=${callSystemPromptBytes}, maxRetries=${maxRetries})`);
+
   // Tracks the Query instance currently being iterated so `close()` can
   // forward termination to the underlying SDK subprocess across retries.
   let currentQuery: ReturnType<typeof sdkQuery> | undefined;
@@ -781,18 +799,23 @@ function sdkQueryWithRetry(
   // On the first call to next(), we attempt sdkQuery. If it throws, we retry.
   async function* retryableStream() {
     let lastErr: Error | undefined;
+    let successful = false;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (closed) return;
+      const attemptStartedAt = Date.now();
       try {
         if (currentEvaluationInjectionContract()) {
           commitEvaluationExposureSince(0, 'sdk_handoff_observed');
         }
+        logger.info('LLMCall', `sdkQuery: attempt ${attempt + 1}/${maxRetries + 1} start (model=${callModel})`);
         currentQuery = sdkQuery(mergedParams);
         // Yield all messages from the stream
         for await (const msg of currentQuery) {
           if (closed) return;
           yield msg;
         }
+        successful = true;
+        logger.info('LLMCall', `sdkQuery: attempt ${attempt + 1}/${maxRetries + 1} done (${Date.now() - attemptStartedAt}ms, model=${callModel})`);
         return; // Success — exit generator
       } catch (err) {
         lastErr = err as Error;
@@ -1090,6 +1113,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       const startFocusDetection = () => {
         focusPromise ??= detectFocusApps(this.traceProcessorService, traceId, {
           timeRange: focusAppTimeRangeFromSelection(options.selectionContext),
+          sceneType,
         }).catch((err) => {
           console.warn('[ClaudeRuntime] Focus app detection failed (graceful):', diagnosticLogIdentity((err as Error).message));
           return emptyFocusResult;
@@ -3771,6 +3795,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
     let effectivePackageName = options.packageName;
     const focusResult = precomputed?.focusResult ?? await detectFocusApps(this.traceProcessorService, traceId, {
       timeRange: focusAppTimeRangeFromSelection(options.selectionContext),
+      sceneType: precomputed?.sceneType,
     });
 
     if (focusResult.primaryApp) {

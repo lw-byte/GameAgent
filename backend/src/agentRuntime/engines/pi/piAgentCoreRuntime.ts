@@ -28,6 +28,7 @@ import {
 } from '../../../services/rag/toolResultProjectionFilter';
 import { completeFinalReportCodeReferences } from '../../../services/codebase/codeReferenceContract';
 import { extractSourceLookupCodeReferences } from '../../../services/codebase/sourceLookupTools';
+import { logger } from '../../../utils/logger';
 import {
   createPiAgentCoreSnapshotEngineState,
   getPiAgentCoreSnapshotEngineState,
@@ -1043,14 +1044,18 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
     traceId: string,
     options: AnalysisOptions = {},
   ): Promise<AnalysisResult> {
+    const analyzeStartedAt = Date.now();
+    logger.info('LLMCall', `PiRuntime.analyze: enter (sessionId=${sessionId}, traceId=${traceId}, queryLength=${query.length}, analysisMode=${options.analysisMode ?? 'auto'})`);
     options = {
       ...options,
       analysisMode: resolveEffectiveAnalysisMode(options.analysisMode, options),
     };
     const fakeStream = truthyEnv(this.env[PI_AGENT_CORE_FAKE_STREAM_ENV]);
-    return fakeStream
-      ? this.analyzeFakeStream(query, sessionId, traceId, options)
-      : this.analyzeWithSmartPerfettoTools(query, sessionId, traceId, options);
+    const result = fakeStream
+      ? await this.analyzeFakeStream(query, sessionId, traceId, options)
+      : await this.analyzeWithSmartPerfettoTools(query, sessionId, traceId, options);
+    logger.info('LLMCall', `PiRuntime.analyze: done (${Date.now() - analyzeStartedAt}ms, terminationReason=${result.terminationReason})`);
+    return result;
   }
 
   private getInitialMessagesForSession(sessionId: string): unknown[] {

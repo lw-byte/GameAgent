@@ -386,18 +386,48 @@ export class TraceProcessorService extends EventEmitter {
       const processor = await this.createProcessor(traceId);
       this.processors.set(traceId, processor);
 
-      // Extract metadata
-      const metadata = await this.extractMetadata(processor);
-      trace.metadata = metadata;
-
+      // Mark ready immediately so callers can issue SQL queries. The
+      // (potentially expensive) extractMetadata scan runs in the background
+      // and populates `trace.metadata` when it lands; consumers use
+      // optional chaining (`traceInfo?.metadata?.startTime`) so an absent
+      // metadata object is harmless — see agentReportData.ts:115.
       trace.status = 'ready';
       this.emit('trace-processed', trace);
       this.emit('trace-status-changed', trace);
+
+      void this.extractMetadataInBackground(traceId, processor);
     } catch (error: any) {
       console.error(`[TraceProcessorService] Failed to process trace ${traceId}:`, error.message);
       trace.status = 'error';
       trace.error = error.message;
       this.emit('trace-status-changed', trace);
+    }
+  }
+
+  /**
+   * Run the metadata scan in the background after the trace is marked ready.
+   * Logs wall-clock time + event count so latency investigations can see how
+   * long the COUNT(*) scan actually takes on a given trace.
+   */
+  private async extractMetadataInBackground(traceId: string, processor: TraceProcessor): Promise<void> {
+    const trace = this.traces.get(traceId);
+    if (!trace) return;
+    const startedAt = Date.now();
+    try {
+      const metadata: NonNullable<TraceInfo['metadata']> =
+        (await this.extractMetadata(processor)) ?? {};
+      const elapsedMs = Date.now() - startedAt;
+      trace.metadata = metadata;
+      const numEvents = metadata.numEvents;
+      console.log(
+        `[TraceProcessorService] extractMetadata background done for ${traceId} (${elapsedMs}ms, numEvents=${numEvents ?? 'n/a'})`,
+      );
+      this.emit('trace-status-changed', trace);
+    } catch (err) {
+      console.warn(
+        `[TraceProcessorService] extractMetadata background failed for ${traceId} (${Date.now() - startedAt}ms):`,
+        (err as Error).message,
+      );
     }
   }
 

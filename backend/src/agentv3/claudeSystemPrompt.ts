@@ -15,6 +15,7 @@ import type { SceneType } from './sceneClassifier';
 import type { ArchitectureInfo } from '../agent/detectors/types';
 import type { DetectedFocusApp } from './focusAppDetector';
 import { formatDurationNs } from './focusAppDetector';
+import { logger } from '../utils/logger';
 import {
   getFinalReportContract,
   getStrategyContent,
@@ -104,16 +105,22 @@ function buildArchitectureSection(
 /** Build focus app list section. Used by both full and quick prompts. */
 function buildFocusAppSection(
   focusApps: DetectedFocusApp[],
-  focusMethod?: 'battery_stats' | 'oom_adj' | 'frame_timeline' | 'none',
+  focusMethod?: 'battery_stats' | 'oom_adj' | 'frame_timeline' | 'game_threads' | 'none',
 ): string {
   const isFrameMode = focusMethod === 'frame_timeline';
+  const isGameThreadsMode = focusMethod === 'game_threads';
   const scoped = focusApps.some(app => app.scopeStartNs !== undefined && app.scopeEndNs !== undefined);
   const scopeText = scoped ? '当前选区/范围内' : 'trace 期间';
   const appLines = focusApps.map((app, i) => {
     const marker = i === 0 ? ' **(主焦点)** ' : ' ';
-    const countLabel = isFrameMode
-      ? `${app.switchCount} 帧`
-      : `切换 ${app.switchCount} 次`;
+    // game_threads tier surfaces thread-match count via totalDurationNs;
+    // frame_timeline tier surfaces frame count via switchCount. Other tiers
+    // use the legacy "switched N times" label.
+    const countLabel = isGameThreadsMode
+      ? `匹配 ${app.totalDurationNs} 个游戏引擎线程`
+      : isFrameMode
+        ? `${app.switchCount} 帧`
+        : `切换 ${app.switchCount} 次`;
     const scopeRef = app.scopeStartNs !== undefined && app.scopeEndNs !== undefined
       ? `；scope_start_ns=${app.scopeStartNs}，scope_end_ns=${app.scopeEndNs}`
       : '';
@@ -593,6 +600,9 @@ export function buildSystemPromptParts(
   maxTokens?: number,
   options: SystemPromptBuildOptions = {},
 ): SystemPromptParts {
+  const startedAt = Date.now();
+  logger.debug('Phase0', `buildSystemPromptParts: enter (sceneType=${context.sceneType ?? 'general'}, maxTokens=${maxTokens ?? MAX_PROMPT_TOKENS}, truncateSceneCore=${options.truncateSceneCore ?? true})`);
+
   const effectiveMaxTokens = maxTokens ?? MAX_PROMPT_TOKENS;
   const shouldTruncateSceneCore = options.truncateSceneCore ?? true;
   const segments: PromptSegment[] = [];
@@ -966,6 +976,10 @@ export function buildSystemPromptParts(
   const stablePrefix = joinSegments(segments, s => s.tier <= 3);
   const volatileSuffix = joinSegments(segments, s => s.tier === 4);
 
+  const elapsedMs = Date.now() - startedAt;
+  const totalTokens = segments.reduce((sum, s) => sum + (s.estimatedTokens ?? 0), 0);
+  logger.info('Phase0', `buildSystemPromptParts: done (segments=${segments.length}, dropped=${droppedLabels.length}, truncated=${truncatedLabels.length}, ~${totalTokens} tokens, ${elapsedMs}ms)`);
+
   return {
     stablePrefix,
     volatileSuffix,
@@ -994,7 +1008,7 @@ export function buildQuickSystemPrompt(opts: {
   architecture?: ArchitectureInfo;
   packageName?: string;
   focusApps?: DetectedFocusApp[];
-  focusMethod?: 'battery_stats' | 'oom_adj' | 'frame_timeline' | 'none';
+  focusMethod?: 'battery_stats' | 'oom_adj' | 'frame_timeline' | 'game_threads' | 'none';
   selectionContext?: SelectionContext;
   runtimeEvidenceContext?: string;
   quickMemoryContext?: string;

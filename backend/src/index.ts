@@ -474,6 +474,30 @@ installEpipeGuard((error) => {
   gracefulShutdown('uncaughtException');
 });
 
+// Signal-source forensics: log every signal that could terminate this process
+// before handing it off to gracefulShutdown. Without this, "process disappeared
+// with no log output" is impossible to distinguish from OOM kill or shell hangup.
+process.on('SIGTERM', () => {
+  console.warn(`[BACKEND] Received SIGTERM at ${new Date().toISOString()} (pid=${process.pid}, uptime=${Math.round(process.uptime())}s, parentPid=${process.ppid})`);
+  // Re-raise as a fresh SIGTERM so the existing shutdown handler chain fires.
+  // process.exit() would skip the graceful drain (open sockets, in-flight SSE).
+  process.kill(process.pid, 'SIGTERM');
+});
+process.on('SIGINT', () => {
+  console.warn(`[BACKEND] Received SIGINT at ${new Date().toISOString()} (pid=${process.pid}, uptime=${Math.round(process.uptime())}s, parentPid=${process.ppid})`);
+  process.kill(process.pid, 'SIGINT');
+});
+process.on('SIGHUP', () => {
+  console.warn(`[BACKEND] Received SIGHUP at ${new Date().toISOString()} (pid=${process.pid}, uptime=${Math.round(process.uptime())}s, parentPid=${process.ppid})`);
+  process.kill(process.pid, 'SIGHUP');
+});
+// SIGBREAK is Windows-only (Ctrl+Break in cmd). Useful when SmartPerfetto runs
+// in WSL or Windows native and the operator hits the console break sequence.
+process.on('SIGBREAK' as NodeJS.Signals, () => {
+  console.warn(`[BACKEND] Received SIGBREAK at ${new Date().toISOString()} (pid=${process.pid}, uptime=${Math.round(process.uptime())}s, parentPid=${process.ppid})`);
+  process.kill(process.pid, 'SIGTERM');
+});
+
 process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });

@@ -463,7 +463,7 @@ fi
 
 echo "Waiting for backend..."
 if ! smartperfetto_wait_for_http \
-  "$BACKEND_PID" "Backend" "$BACKEND_HEALTH_URL" 40 "$BACKEND_LOG"; then
+  "$BACKEND_PID" "Backend" "$BACKEND_HEALTH_URL" 80 "$BACKEND_LOG"; then
   exit 1
 fi
 

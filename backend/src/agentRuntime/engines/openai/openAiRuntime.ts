@@ -161,6 +161,7 @@ import {
   loadCodeReferenceContractPrompt,
 } from '../../../services/codebase/codeReferenceContract';
 import { extractSourceLookupCodeReferences } from '../../../services/codebase/sourceLookupTools';
+import { logger } from '../../../utils/logger';
 import { buildQuickProcessIdentityDirectAnswer } from '../../quickProcessIdentityDirectAnswer';
 import {
   buildQuickProcessIdentityEvidence,
@@ -1250,6 +1251,7 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
 
           let streamCompleted = false;
           try {
+            logger.info('LLMCall', `OpenAI runStream: start (model=${agent.model ?? 'unknown'}, quickMode=${quickMode}, maxTurns=${quickMode ? config.quickMaxTurns : config.maxTurns}, previousResponseId=${currentPreviousResponseId ?? 'none'})`);
             stream = await runStream();
             analysisAbortScope.throwIfAborted();
             try {
@@ -1284,6 +1286,7 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
                 ?? (stream as any).state?.usage;
               recordEvaluationTokenDeltaIfPresent(evaluationUsage);
               streamCompleted = true;
+            logger.info('LLMCall', `OpenAI runStream: completed (turns=${runTurns})`);
             } catch (error) {
               if (!(isAbortLikeError(error) && (completedByPlanIdle || timedOut))) {
                 throw error;

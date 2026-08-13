@@ -62,6 +62,16 @@ export interface DiagnosticLogContext {
   classifier?: 'sql';
 }
 
+/**
+ * Return the current wall-clock time as an ISO-8601 string with millisecond
+ * precision (e.g. "2026-08-12T12:24:05.871Z"). Used to prefix every log line
+ * so latency investigations can correlate trace analysis stages by absolute
+ * time, even when the entries are interleaved across multiple subsystems.
+ */
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
 function stableDiagnosticToken(value: string | undefined, fallback: string): string {
   const token = value?.trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, '_').replace(/^_+|_+$/g, '');
   return token || fallback;
@@ -91,24 +101,24 @@ export function diagnosticLogIdentity(
 
 export const logger = {
   error: (tag: string, message: string, ...args: any[]) => {
-    console.error(`[${tag}] ${message}`, ...args);
+    console.error(`[${nowIso()}] [${tag}] ${message}`, ...args);
   },
 
   warn: (tag: string, message: string, ...args: any[]) => {
     if (getCurrentLevel() >= LOG_LEVELS.warn) {
-      console.warn(`[${tag}] ${message}`, ...args);
+      console.warn(`[${nowIso()}] [${tag}] ${message}`, ...args);
     }
   },
 
   info: (tag: string, message: string, ...args: any[]) => {
     if (getCurrentLevel() >= LOG_LEVELS.info) {
-      console.log(`[${tag}] ${message}`, ...args);
+      console.log(`[${nowIso()}] [${tag}] ${message}`, ...args);
     }
   },
 
   debug: (tag: string, message: string, ...args: any[]) => {
     if (getCurrentLevel() >= LOG_LEVELS.debug) {
-      console.log(`[${tag}] ${message}`, ...args);
+      console.log(`[${nowIso()}] [${tag}] ${message}`, ...args);
     }
   },
 
@@ -117,9 +127,9 @@ export const logger = {
     if (getCurrentLevel() >= LOG_LEVELS.debug) {
       const identity = sqlLogIdentity(sql);
       if (durationMs !== undefined) {
-        console.log(`[${tag}] SQL (${durationMs}ms): ${identity}`);
+        console.log(`[${nowIso()}] [${tag}] SQL (${durationMs}ms): ${identity}`);
       } else {
-        console.log(`[${tag}] SQL: ${identity}`);
+        console.log(`[${nowIso()}] [${tag}] SQL: ${identity}`);
       }
     }
   },

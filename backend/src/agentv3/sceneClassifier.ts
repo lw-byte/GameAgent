@@ -15,6 +15,7 @@
  */
 
 import { getRegisteredScenes } from './strategyLoader';
+import { logger } from '../utils/logger';
 
 export type SceneType = string;
 
@@ -101,6 +102,9 @@ function matchesKeyword(query: string, lowerQuery: string, keyword: string): boo
  *   ANR (1) → startup (2) → scrolling (3) → interaction (4) → overview (5) → general (99)
  */
 export function classifyScene(query: string): SceneType {
+  const startedAt = Date.now();
+  logger.debug('Phase0', `classifyScene: enter (queryLength=${query.length})`);
+
   const scenes = getRegisteredScenes();
   const lower = query.toLowerCase();
 
@@ -112,13 +116,19 @@ export function classifyScene(query: string): SceneType {
   for (const scene of sorted) {
     // Compound patterns first (more specific)
     if (scene.compoundPatterns.length > 0 && scene.compoundPatterns.some(p => p.test(query))) {
+      const elapsedMs = Date.now() - startedAt;
+      logger.debug('Phase0', `classifyScene: hit=${scene.scene} via compound_pattern (${elapsedMs}ms)`);
       return scene.scene;
     }
     // Then keyword matching
     if (scene.keywords.some(k => matchesKeyword(query, lower, k))) {
+      const elapsedMs = Date.now() - startedAt;
+      logger.debug('Phase0', `classifyScene: hit=${scene.scene} via keyword (${elapsedMs}ms)`);
       return scene.scene;
     }
   }
 
+  const elapsedMs = Date.now() - startedAt;
+  logger.debug('Phase0', `classifyScene: hit=general (no match, ${elapsedMs}ms)`);
   return 'general';
 }

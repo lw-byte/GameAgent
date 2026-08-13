@@ -60,7 +60,7 @@ import type { AnalysisOptions, IOrchestrator, TraceDataset } from '../agent/core
 import { resolveConclusionScene } from '../agent/core/conclusionSceneTemplates';
 import { DEEP_REASON_LABEL } from '../utils/analysisNarrative';
 import { localize, parseOutputLanguage, type OutputLanguage } from '../agentv3/outputLanguage';
-import { diagnosticLogIdentity } from '../utils/logger';
+import { diagnosticLogIdentity, logger } from '../utils/logger';
 import { sanitizeNarrativeForClient } from './narrativeSanitizer';
 import { registerSceneReconstructRoutes } from './agentSceneReconstructRoutes';
 import { SceneStoryService } from '../agent/scene/sceneStoryService';
@@ -2275,6 +2275,7 @@ async function handleAnalyzeRequest(
   res: express.Response,
   requestedSessionIdOverride?: string,
 ): Promise<void> {
+  const handleStartedAt = Date.now();
   let executionSession: AnalysisSession | undefined;
   let executionRunId: string | undefined;
   let executionRunManifestLifecycle: RunManifestLifecycle | undefined;
@@ -2299,6 +2300,7 @@ async function handleAnalyzeRequest(
       (rawOptions.outputLanguage === 'en' || rawOptions.outputLanguage === 'zh-CN')
       ? rawOptions.outputLanguage
       : configuredOutputLanguage();
+    logger.info('HTTPEntry', `handleAnalyzeRequest: enter (traceId=${traceId ?? 'unknown'}, queryLength=${typeof query === 'string' ? query.length : 'n/a'}, requestedSessionId=${requestedSessionId ?? 'new'}, referenceTraceId=${referenceTraceId ?? 'none'}, outputLanguage=${earlyOutputLanguage})`);
     if (!hasRbacPermission(requestContext, 'agent:run')) {
       sendForbidden(res, 'Starting analysis requires agent:run permission');
       return;

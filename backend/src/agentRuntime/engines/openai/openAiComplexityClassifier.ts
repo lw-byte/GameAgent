@@ -18,6 +18,7 @@ import { buildComplexityClassifierPrompt } from '../../../agentv3/queryComplexit
 import type { ComplexityClassifierInput, QueryComplexity } from '../../../agentv3/types';
 import { buildOpenAIChatCompletionsTokenLimit } from '../../../services/providerManager/openAiChatCompletionsCompat';
 import type { OpenAIAgentConfig } from './openAiConfig';
+import { logger } from '../../../utils/logger';
 
 interface ChatCompletionsResponse {
   choices?: Array<{
@@ -84,6 +85,9 @@ export async function classifyQueryWithOpenAILightModel(
     controller.abort();
   }, timeoutMs);
 
+  const llmStartedAt = Date.now();
+  logger.info('LLMCall', `OpenAI complexity classifier: fetch start (model=${config.lightModel}, url=${url}, timeoutMs=${timeoutMs})`);
+
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -101,17 +105,21 @@ export async function classifyQueryWithOpenAILightModel(
     });
 
     if (!res.ok) {
+      logger.warn('LLMCall', `OpenAI complexity classifier: HTTP ${res.status} (${Date.now() - llmStartedAt}ms)`);
       return { complexity: 'full', reason: `OpenAI classifier HTTP ${res.status}` };
     }
 
     const data = (await res.json()) as ChatCompletionsResponse;
     const text = data.choices?.[0]?.message?.content ?? '';
+    logger.info('LLMCall', `OpenAI complexity classifier: fetch done (${Date.now() - llmStartedAt}ms)`);
     return parseClassifierJson(text);
   } catch (err) {
     if (analysisSignal?.aborted) throw err;
     if (timedOut) {
+      logger.warn('LLMCall', `OpenAI complexity classifier: timed out (${Date.now() - llmStartedAt}ms)`);
       return { complexity: 'full', reason: `OpenAI classifier timed out after ${timeoutMs / 1000}s` };
     }
+    logger.warn('LLMCall', `OpenAI complexity classifier: failed (${Date.now() - llmStartedAt}ms): ${(err as Error).message}`);
     return { complexity: 'full', reason: `OpenAI classifier failed: ${(err as Error).message}` };
   } finally {
     clearTimeout(timer);

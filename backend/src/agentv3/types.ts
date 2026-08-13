@@ -83,7 +83,7 @@ export interface ClaudeAnalysisContext {
   packageName?: string;
   focusApps?: DetectedFocusApp[];
   /** Detection method used for focus apps — affects display labels */
-  focusMethod?: 'battery_stats' | 'oom_adj' | 'frame_timeline' | 'none';
+  focusMethod?: 'battery_stats' | 'oom_adj' | 'frame_timeline' | 'game_threads' | 'none';
   previousFindings?: Finding[];
   conversationSummary?: string;
   /** Perfetto SQL knowledge context matched to the user query (from ExtendedSqlKnowledgeBase) */

@@ -344,7 +344,45 @@ function resolvePointer(
 }
 
 export class AndroidInternalsPackResolver {
+  /**
+   * Memoization cache for resolve(). The pin-aware cache prevents re-running
+   * manifest verification + pointer reads + bundled directory materialization
+   * on every analyze request. TTL is intentionally short so revocations or
+   * pin updates pick up within a few minutes.
+   *
+   * Key shape: serialized pin (or 'null' for the no-pin lookup). Different
+   * pins cache independently because they resolve to different handles.
+   */
+  private static readonly CACHE_TTL_MS = 5 * 60 * 1000;
+  private cache:
+    | { key: string; result: AndroidInternalsPackHandle | undefined; expiresAt: number }
+    | null = null;
+
   resolve(pin?: Partial<AndroidInternalsPackIdentity>): AndroidInternalsPackHandle | undefined {
+    // Bypass cache when the feature is explicitly disabled so an operator's
+    // env-var flip takes effect immediately.
+    if (process.env.SMARTPERFETTO_AIW_PACK_ENABLED !== '0') {
+      const cacheKey = pin ? JSON.stringify(pin) : 'null';
+      const now = Date.now();
+      if (this.cache && this.cache.key === cacheKey && this.cache.expiresAt > now) {
+        return this.cache.result;
+      }
+    }
+
+    const result = this.resolveUncached(pin);
+
+    if (process.env.SMARTPERFETTO_AIW_PACK_ENABLED !== '0') {
+      const cacheKey = pin ? JSON.stringify(pin) : 'null';
+      this.cache = {
+        key: cacheKey,
+        result,
+        expiresAt: Date.now() + AndroidInternalsPackResolver.CACHE_TTL_MS,
+      };
+    }
+    return result;
+  }
+
+  private resolveUncached(pin?: Partial<AndroidInternalsPackIdentity>): AndroidInternalsPackHandle | undefined {
     if (process.env.SMARTPERFETTO_AIW_PACK_ENABLED === '0') return undefined;
     const configuredVersion = pin?.contentVersion || process.env.SMARTPERFETTO_AIW_PACK_PIN;
     if (configuredVersion) {

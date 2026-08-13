@@ -18,7 +18,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
-import {diagnosticLogIdentity} from '../../../utils/logger';
+import {diagnosticLogIdentity, logger} from '../../../utils/logger';
 import { createSdkEnv, getSdkBinaryOption } from './claudeConfig';
 import type { Finding, StreamingUpdate } from '../../../agent/types';
 import type { VerificationResult, VerificationIssue, AnalysisPlanV3, Hypothesis, ToolCallRecord } from '../../../agentv3/types';
@@ -930,6 +930,8 @@ export async function verifyWithLLM(
 ): Promise<VerificationIssue[] | undefined> {
   // Default 60s; Haiku usually finishes in 2-5s, but slower LLMs need more headroom.
   const VERIFY_TIMEOUT_MS = options?.timeoutMs ?? 60_000;
+  const verifyStartedAt = Date.now();
+  logger.info('LLMCall', `verifyWithLLM: enter (findingsCount=${findings.length}, conclusionBytes=${conclusion.length}, model=${options?.model ?? 'claude-haiku-4-5'}, timeoutMs=${VERIFY_TIMEOUT_MS})`);
   try {
     const findingSummary = findings
       .slice(0, 15)
@@ -961,6 +963,8 @@ ${conclusionPreview}${truncationNote}
 \`\`\``;
 
     const sdkEnv = createSdkEnv();
+    logger.info('LLMCall', `verifyWithLLM: sdkQuery start (model=${options?.model ?? 'claude-haiku-4-5'})`);
+    const sdkQueryStartedAt = Date.now();
     const stream = sdkQuery({
       prompt,
       options: {
@@ -1001,9 +1005,11 @@ ${conclusionPreview}${truncationNote}
 
     if (timedOut) {
       console.warn('[ClaudeVerifier] Returning undefined due to timeout (graceful degradation)');
+      logger.warn('LLMCall', `verifyWithLLM: timed out (sdkQuery=${Date.now() - sdkQueryStartedAt}ms, total=${Date.now() - verifyStartedAt}ms)`);
       return undefined;
     }
 
+    logger.info('LLMCall', `verifyWithLLM: sdkQuery done (sdkQuery=${Date.now() - sdkQueryStartedAt}ms)`);
     const parsed = parseVerifierJsonIssues(result);
     // LLM may return non-standard severity levels (e.g. "critical", "high", "medium")
     // that don't match the VerificationIssue type union ('error' | 'warning').
@@ -1017,6 +1023,7 @@ ${conclusionPreview}${truncationNote}
       }));
   } catch (err) {
     console.warn('[ClaudeVerifier] LLM verification failed (graceful degradation):', (err as Error).message);
+    logger.warn('LLMCall', `verifyWithLLM: failed (${Date.now() - verifyStartedAt}ms): ${(err as Error).message}`);
     return undefined;
   }
 }

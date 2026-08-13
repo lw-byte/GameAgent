@@ -162,7 +162,7 @@ export function isTraceProcessorReadyMessage(text: string): boolean {
 // INCLUDE PERFETTO MODULE in SQL queries — no need to preload them here.
 const CRITICAL_STDLIB_MODULES = [
   'android.frames.timeline',    // 19 skills, 19 TS refs — frame/jank analysis foundation
-  'android.startup.startups',   // 16 skills, 32 TS refs — startup analysis foundation
+//  'android.startup.startups',   // 16 skills, 32 TS refs — startup analysis foundation
   'android.binder',             // 22 skills,  6 TS refs — IPC/blocking analysis foundation
 ];
 
@@ -1184,7 +1184,28 @@ export function isTraceProcessorEvictionCandidate(
 export class TraceProcessorFactory {
   private static processors: Map<string, ManagedTraceProcessor> = new Map();
   private static externalProcessorsByPort: Map<number, ExternalRpcProcessor> = new Map();
-  private static maxProcessors = 5;
+  /**
+   * Maximum concurrent `trace_processor_shell` processes kept alive in the
+   * LRU pool. Over this count the eviction loop (`create()`) destroys the
+   * oldest idle processor to make room for a new one — and the evicted
+   * processor will pay a 3-5s cold-start cost on its next use.
+   *
+   * Override via `SMARTPERFETTO_TP_MAX_PROCESSORS`. Recommended values:
+   * - 3:  Docker / portable (memory-constrained)
+   * - 5:  16 GB dev machine (default)
+   * - 8:  32 GB workstation
+   * - 10-12: 64 GB+ analysis server
+   *
+   * The RAM budget gate (`assertTraceProcessorAdmission`) still rejects
+   * spawns that would push total resident set past `SMARTPERFETTO_TP_RAM_BUDGET_*`,
+   * so raising this count is safe as long as RAM headroom is available.
+   */
+  private static get maxProcessors(): number {
+    const raw = process.env.SMARTPERFETTO_TP_MAX_PROCESSORS;
+    if (!raw) return 5;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 5;
+  }
 
   static async create(
     traceId: string,

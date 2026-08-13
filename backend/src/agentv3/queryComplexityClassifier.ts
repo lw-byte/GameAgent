@@ -16,6 +16,7 @@
 
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import { createSdkEnv, getSdkBinaryOption, type ClaudeAgentConfig } from './claudeConfig';
+import { logger } from '../utils/logger';
 import {
   SCROLLING_TRIAGE_LOOKUP_REASON,
   shouldUseQuickScrollingTriageIntent,
@@ -245,6 +246,12 @@ export function classifyQueryComplexityLocal(
     return { ...scopeResult, source: 'hard_rule' };
   }
 
+  const gameSceneResult = applyGameSceneRule(input);
+  if (gameSceneResult) {
+    console.log(`[ComplexityClassifier] Game scene rule → ${gameSceneResult.complexity}: ${gameSceneResult.reason}`);
+    return { ...gameSceneResult, source: 'hard_rule' };
+  }
+
   const identityFactResult = applyIdentityFactRule(input.query);
   if (identityFactResult) {
     console.log(
@@ -277,15 +284,24 @@ export async function classifyQueryComplexity(
   input: ComplexityClassifierInput,
   config?: Pick<ClaudeAgentConfig, 'lightModel' | 'classifierTimeoutMs'>,
 ): Promise<{ complexity: QueryComplexity; reason: string; source: 'hard_rule' | 'ai' }> {
+  const startedAt = Date.now();
+  logger.debug('Phase0', `classifyQueryComplexity: enter (queryLength=${input.query.length}, lightModel=${config?.lightModel ?? 'default'}, timeoutMs=${config?.classifierTimeoutMs ?? 30000})`);
+
   const local = classifyQueryComplexityLocal(input);
-  if (local) return local;
+  if (local) {
+    logger.info('Phase0', `classifyQueryComplexity: source=hard_rule complexity=${local.complexity} reason=${local.reason} (${Date.now() - startedAt}ms)`);
+    return local;
+  }
 
   try {
+    const aiStartedAt = Date.now();
+    logger.info('Phase0', `classifyQueryComplexity: invoking Haiku classifier (LLM call)...`);
     const aiResult = await classifyWithHaiku(input, config?.lightModel, config?.classifierTimeoutMs);
-    console.log(`[ComplexityClassifier] AI → ${aiResult.complexity}: ${aiResult.reason}`);
+    logger.info('Phase0', `classifyQueryComplexity: source=ai complexity=${aiResult.complexity} reason=${aiResult.reason} (LLM call ${Date.now() - aiStartedAt}ms, total ${Date.now() - startedAt}ms)`);
     return { ...aiResult, source: 'ai' };
   } catch (err) {
     console.warn('[ComplexityClassifier] Haiku classification failed, defaulting to full:', (err as Error).message);
+    logger.warn('Phase0', `classifyQueryComplexity: degraded complexity=full reason=AI classification failed (${Date.now() - startedAt}ms)`);
     return { complexity: 'full', reason: 'AI classification failed (graceful degradation)', source: 'ai' };
   }
 }
@@ -301,6 +317,35 @@ function applyScopeHardRules(
 ): { complexity: QueryComplexity; reason: string } | null {
   if (input.hasReferenceTrace) {
     return { complexity: 'full', reason: 'comparison mode' };
+  }
+  return null;
+}
+
+/**
+ * Game scene hard rule.
+ *
+ * The classifier LLM call was hanging for 30s on `MiniMax-M3[1m]` (MiniMax
+ * anthropic-compatible gateway emits `system` init message but never sends
+ * the terminal `result` — see classifyWithHaiku timeout diagnostics). Game
+ * queries always need full evidence chain anyway:
+ *   - Game strategy mandates submit_plan + verifier + claim verification
+ *   - fps_and_gpu + engine_loop_jank phases both require invoke_skill
+ *   - The "quick" pre-evidence path skips the verifier, which would risk
+ *     missing GPU / engine loop / frame jank root causes for the very
+ *     symptoms game users typically report
+ *
+ * Forcing full at the local-rules stage eliminates the LLM call entirely
+ * for game queries, dropping the per-request overhead from ~30s timeout
+ * (graceful-degradation default) to < 1ms. Position is after the ack rule
+ * (so short follow-ups like "ok" still return quick for resumed sessions)
+ * and before identity/trace/scrolling rules (so even simple factual
+ * queries in a game session route to full).
+ */
+function applyGameSceneRule(
+  input: ComplexityClassifierInput,
+): { complexity: QueryComplexity; reason: string } | null {
+  if (input.sceneType === 'game') {
+    return { complexity: 'full', reason: 'game scene requires full evidence chain' };
   }
   return null;
 }
@@ -602,6 +647,8 @@ async function classifyWithHaiku(
   // Default 30s; Haiku usually finishes in 1-2s, but non-Haiku light models can need longer.
   const CLASSIFY_TIMEOUT_MS = timeoutMs ?? 30_000;
   const sdkEnv = createSdkEnv();
+  const llmStartedAt = Date.now();
+  logger.info('LLMCall', `classifyWithHaiku: sdkQuery start (model=${model ?? 'claude-haiku-4-5'}, timeoutMs=${CLASSIFY_TIMEOUT_MS}, promptBytes=${Buffer.byteLength(prompt, 'utf8')})`);
   const stream = sdkQuery({
     prompt,
     options: {
@@ -621,6 +668,15 @@ async function classifyWithHaiku(
 
   let result = '';
   let timedOut = false;
+  // Diagnostic counters — distinguish "upstream sent nothing" (0 messages)
+  // from "upstream sent events but never a terminal result" (N messages,
+  // result missing). Both manifest as 30s timeout to the caller, but the
+  // upstream root cause is very different.
+  let firstByteAt: number | null = null;
+  const messageCounts: Record<string, number> = {};
+  const bumpType = (type: string) => {
+    messageCounts[type] = (messageCounts[type] ?? 0) + 1;
+  };
   const timer = setTimeout(() => {
     timedOut = true;
     console.warn(`[ComplexityClassifier] Classification timed out after ${CLASSIFY_TIMEOUT_MS / 1000}s`);
@@ -629,15 +685,36 @@ async function classifyWithHaiku(
 
   try {
     for await (const msg of stream) {
+      if (firstByteAt === null) {
+        firstByteAt = Date.now();
+        logger.info(
+          'LLMCall',
+          `classifyWithHaiku: first SDK message (${firstByteAt - llmStartedAt}ms after start, type=${(msg as { type?: string }).type ?? 'unknown'})`,
+        );
+      }
+      bumpType((msg as { type?: string }).type ?? 'unknown');
       if (timedOut) break;
       result = successfulSdkResultText(msg) ?? result;
     }
   } finally {
     clearTimeout(timer);
     try { stream.close(); } catch { /* ignore */ }
+    const countsSummary = JSON.stringify(messageCounts);
+    if (timedOut) {
+      logger.warn(
+        'LLMCall',
+        `classifyWithHaiku: timeout after ${Date.now() - llmStartedAt}ms; messageCounts=${countsSummary}; firstByteAt=${firstByteAt !== null ? `${firstByteAt - llmStartedAt}ms` : 'never'}; result=${result.length}chars`,
+      );
+    } else if (firstByteAt !== null) {
+      logger.info(
+        'LLMCall',
+        `classifyWithHaiku: stream end (${Date.now() - llmStartedAt}ms total, ${Date.now() - firstByteAt}ms after first byte); messageCounts=${countsSummary}; result=${result.length}chars`,
+      );
+    }
   }
 
   if (timedOut) {
+    logger.warn('LLMCall', `classifyWithHaiku: sdkQuery timed out (${Date.now() - llmStartedAt}ms)`);
     return { complexity: 'full', reason: 'classification timed out (graceful degradation)' };
   }
 
@@ -646,11 +723,14 @@ async function classifyWithHaiku(
     try {
       const parsed = JSON.parse(jsonMatch[0]);
       const complexity: QueryComplexity = parsed.complexity === 'quick' ? 'quick' : 'full';
+      logger.info('LLMCall', `classifyWithHaiku: sdkQuery done complexity=${complexity} (${Date.now() - llmStartedAt}ms)`);
       return { complexity, reason: parsed.reason || 'AI classification' };
     } catch {
+      logger.warn('LLMCall', `classifyWithHaiku: sdkQuery JSON parse failed (${Date.now() - llmStartedAt}ms)`);
       return { complexity: 'full', reason: 'failed to parse AI JSON response' };
     }
   }
 
+  logger.warn('LLMCall', `classifyWithHaiku: sdkQuery returned no JSON (${Date.now() - llmStartedAt}ms)`);
   return { complexity: 'full', reason: 'no JSON in AI response' };
 }

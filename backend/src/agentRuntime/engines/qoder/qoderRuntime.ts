@@ -38,6 +38,7 @@ import { detectFocusApps, type DetectedFocusApp } from '../../../agentv3/focusAp
 import { localize, parseOutputLanguage, type OutputLanguage } from '../../../agentv3/outputLanguage';
 import { classifyScene, type SceneType } from '../../../agentv3/sceneClassifier';
 import { probeTraceCompleteness } from '../../../agentv3/traceCompletenessProber';
+import { logger } from '../../../utils/logger';
 import type {
   AnalysisNote,
   AnalysisPlanV3,
@@ -261,6 +262,7 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
     options?: AnalysisOptions,
   ): Promise<AnalysisResult> {
     const startTime = Date.now();
+    logger.info('LLMCall', `QoderRuntime.analyze: enter (sessionId=${sessionId}, traceId=${traceId}, queryLength=${query.length}, analysisMode=${options?.analysisMode ?? 'auto'})`);
     const traceProcessorService = options?.traceProcessorService ?? this.input.traceProcessorService;
 
     // Ensure skill registry is ready
@@ -353,7 +355,7 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
 
     // Focus app detection
     let focusApps: DetectedFocusApp[] = [];
-    let focusAppMethod: 'battery_stats' | 'oom_adj' | 'frame_timeline' | 'none' = 'none';
+    let focusAppMethod: 'battery_stats' | 'oom_adj' | 'frame_timeline' | 'game_threads' | 'none' = 'none';
     try {
       const focusResult = await detectFocusApps(
         traceProcessorService,
@@ -635,6 +637,8 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
 
       // Execute the query with timeout
       commitEvaluationSdkHandoffIfActive();
+      const qoderStartedAt = Date.now();
+      logger.info('LLMCall', `QoderRuntime.sdk.query: start (sessionId=${sessionId}, model=${(sdkOptions as { model?: string }).model ?? 'unknown'}, promptBytes=${Buffer.byteLength(fullPrompt ?? '', 'utf8')})`);
       const q = sdk.query({ prompt: fullPrompt, options: sdkOptions });
       sessionState.sdkQuery = q;
 
@@ -710,6 +714,7 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
             }
           }
         }
+        logger.info('LLMCall', `QoderRuntime.sdk.query: stream end (${Date.now() - qoderStartedAt}ms, success=${sdkResultMeta.success}, subtype=${sdkResultMeta.subtype})`);
       };
 
       let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
@@ -849,6 +854,7 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
         { section: 'observation', content: `Analysis completed: ${findings.length} findings`, priority: 'low', timestamp: Date.now() },
       );
 
+      logger.info('LLMCall', `QoderRuntime.analyze: done (${Date.now() - startTime}ms, terminationReason=${result.terminationReason})`);
       return result;
     } catch (error) {
       const totalDurationMs = Date.now() - startTime;

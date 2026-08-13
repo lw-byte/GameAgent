@@ -135,7 +135,7 @@ import {
 } from '../../runtimeToolSpec';
 import { isTraceProcessorQueryCancelledError } from '../../../services/traceProcessorCancellation';
 import { backendDataPath } from '../../../runtimePaths';
-import {diagnosticLogIdentity} from '../../../utils/logger';
+import {diagnosticLogIdentity, logger} from '../../../utils/logger';
 import {
   EXPERIMENTAL_OPENCODE_RUNTIME_KIND,
   OPENCODE_RUNTIME_KIND,
@@ -1736,7 +1736,10 @@ export async function runOpenCodePrompt(
 
   if (isAborted?.()) throw new Error('OpenCode prompt aborted');
   commitEvaluationSdkHandoffIfActive();
+  const ocPromptStartedAt = Date.now();
+  logger.info('LLMCall', `OpenCodeRuntime: client.session.prompt start (sessionId=${sessionId}, projectDir=${projectDir})`);
   const promptResponse = unwrapSdkData(await opencode.client.session.prompt(promptInput), 'OpenCode prompt');
+  logger.info('LLMCall', `OpenCodeRuntime: client.session.prompt done (${Date.now() - ocPromptStartedAt}ms)`);
   if (isAborted?.()) throw new Error('OpenCode prompt aborted');
   const messagesResponse = opencode.client.session.messages
     ? unwrapSdkData(await opencode.client.session.messages({
@@ -1944,6 +1947,8 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     traceId: string,
     options?: AnalysisOptions,
   ): Promise<AnalysisResult> {
+    const analyzeStartedAt = Date.now();
+    logger.info('LLMCall', `OpenCodeRuntime.analyze: enter (sessionId=${sessionId}, traceId=${traceId}, queryLength=${query.length}, analysisMode=${options?.analysisMode ?? 'auto'})`);
     options = {
       ...(options ?? {}),
       analysisMode: resolveEffectiveAnalysisMode(options?.analysisMode, options ?? {}),
@@ -1999,6 +2004,8 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       );
       activeSession.openCodeSessionId = openCodeSessionId;
       this.currentSessionId = openCodeSessionId;
+      const promptStartedAt = Date.now();
+      logger.info('LLMCall', `OpenCodeRuntime hidden prompt: start (sessionId=${openCodeSessionId})`);
       unwrapSdkData(await opencode.client.session.prompt({
         path: { id: openCodeSessionId },
         query: { directory: dirs.projectDir },
@@ -2009,6 +2016,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
           parts: [{ type: 'text', text: buildSmokePrompt(query, traceId, options) }],
         },
       }), 'OpenCode hidden prompt');
+      logger.info('LLMCall', `OpenCodeRuntime hidden prompt: done (${Date.now() - promptStartedAt}ms)`);
     } finally {
       if (activeSession && !privateKnowledge) {
         this.sessionOpaqueStates.set(sessionId, createOpenCodeOpaqueState(
@@ -2033,6 +2041,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       timestamp: Date.now(),
     });
 
+    logger.info('LLMCall', `OpenCodeRuntime.analyze (hidden smoke): done (${Date.now() - analyzeStartedAt}ms)`);
     return {
       sessionId,
       success: true,
@@ -2055,6 +2064,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     options: AnalysisOptions,
   ): Promise<AnalysisResult> {
     const startedAt = Date.now();
+    logger.info('LLMCall', `OpenCodeRuntime.analyzeWithSmartPerfettoTools: enter (sessionId=${sessionId}, traceId=${traceId}, queryLength=${query.length}, analysisMode=${options.analysisMode ?? 'auto'})`);
     const outputLanguage = options.outputLanguage
       ?? parseOutputLanguage(this.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
     const sceneType = classifyScene(query);
