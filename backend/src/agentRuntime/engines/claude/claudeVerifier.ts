@@ -22,8 +22,8 @@ import {diagnosticLogIdentity, logger} from '../../../utils/logger';
 import { createSdkEnv, getSdkBinaryOption } from './claudeConfig';
 import type { Finding, StreamingUpdate } from '../../../agent/types';
 import type { VerificationResult, VerificationIssue, AnalysisPlanV3, Hypothesis, ToolCallRecord } from '../../../agentv3/types';
-import { expectedCallMatchesRecord, expectedToolNames, formatExpectedCall, phaseMatchesCall } from '../../../agentv3/types';
-import { isComparisonSynthesisPlanPhase, isConclusionLikePlanPhase } from '../../../agentv3/planPhaseSemantics';
+import { expectedCallMatchesRecord, expectedToolNames, formatExpectedCall } from '../../../agentv3/types';
+import {getPhaseToolEvidenceStatus} from '../../../agentv3/planToolCallRecorder';
 import type { SceneType } from '../../../agentv3/sceneClassifier';
 import { DEFAULT_OUTPUT_LANGUAGE, localize, type OutputLanguage } from '../../../agentv3/outputLanguage';
 import { backendLogPath } from '../../../runtimePaths';
@@ -207,14 +207,12 @@ export function verifyHeuristic(
 
   // Check 1: CRITICAL findings without evidence
   const criticals = findings.filter(f => f.severity === 'critical');
-  for (const f of criticals) {
-    if (!f.evidence || f.evidence.length === 0) {
-      issues.push({
-        type: 'missing_evidence',
-        severity: 'error',
-        message: `CRITICAL 发现 "${f.title}" 缺少证据支撑`,
-      });
-    }
+  for (const f of findCriticalFindingsWithoutEvidence(findings)) {
+    issues.push({
+      type: 'missing_evidence',
+      severity: 'error',
+      message: `CRITICAL 发现 "${f.title}" 缺少证据支撑`,
+    });
   }
 
   // Check 2: Too many CRITICALs (>5 is suspicious)
@@ -363,41 +361,13 @@ export function verifyHeuristic(
   return issues;
 }
 
-function hasNonConclusionPhaseToolEvidence(
-  plan: AnalysisPlanV3,
-  conclusionPhaseId: string,
-): boolean {
-  const phaseById = new Map(plan.phases.map(phase => [phase.id, phase]));
-  return plan.toolCallLog.some(record => {
-    if (!record.matchedPhaseId || record.matchedPhaseId === conclusionPhaseId) return false;
-    const matchedPhase = phaseById.get(record.matchedPhaseId);
-    return Boolean(matchedPhase && !isConclusionLikePlanPhase(matchedPhase));
-  });
-}
-
-function hasPriorNonConclusionMatchingToolEvidence(
-  plan: AnalysisPlanV3,
-  phase: AnalysisPlanV3['phases'][number],
-): boolean {
-  const phaseById = new Map(plan.phases.map(entry => [entry.id, entry]));
-  const phaseIndex = plan.phases.findIndex(entry => entry.id === phase.id);
-  return plan.toolCallLog.some(record => {
-    if (!record.matchedPhaseId || record.matchedPhaseId === phase.id) return false;
-    const matchedPhase = phaseById.get(record.matchedPhaseId);
-    if (!matchedPhase || isConclusionLikePlanPhase(matchedPhase)) return false;
-    if (phaseIndex >= 0) {
-      const matchedIndex = plan.phases.findIndex(entry => entry.id === matchedPhase.id);
-      if (matchedIndex > phaseIndex) return false;
-    }
-    return phaseMatchesCall(phase, record);
-  });
-}
-
-function expectedCallWasExecutedAnywhere(
-  plan: AnalysisPlanV3,
-  expectedCall: NonNullable<AnalysisPlanV3['phases'][number]['expectedCalls']>[number],
-): boolean {
-  return plan.toolCallLog.some(record => expectedCallMatchesRecord(expectedCall, record));
+export function findCriticalFindingsWithoutEvidence(
+  findings: readonly Finding[],
+): Finding[] {
+  return findings.filter(finding => (
+    finding.severity === 'critical' &&
+    (!finding.evidence || finding.evidence.length === 0)
+  ));
 }
 
 /**
@@ -437,19 +407,9 @@ export function verifyPlanAdherence(plan: AnalysisPlanV3 | null): VerificationIs
   // substantive work. ERROR severity triggers a correction retry.
   const completedPhases = plan.phases.filter(p => p.status === 'completed');
   for (const phase of completedPhases) {
-    const matchedCalls = plan.toolCallLog.filter(t => t.matchedPhaseId === phase.id);
-    const isConclusionPhase = isConclusionLikePlanPhase(phase);
-    const isComparisonSynthesisPhase = isComparisonSynthesisPlanPhase(phase);
-    const hasExternalEvidence = isConclusionPhase &&
-      hasNonConclusionPhaseToolEvidence(plan, phase.id);
-    const hasReusableComparisonEvidence = isComparisonSynthesisPhase &&
-      hasPriorNonConclusionMatchingToolEvidence(plan, phase);
+    const evidenceStatus = getPhaseToolEvidenceStatus(plan, phase);
     const expected = expectedToolNames(phase).join(', ');
-    const missingExpectedCallsForPhase = (phase.expectedCalls ?? [])
-      .filter(call => !matchedCalls.some(record => expectedCallMatchesRecord(call, record)));
-    const missingExpectedCalls = isConclusionPhase
-      ? missingExpectedCallsForPhase.filter(call => !expectedCallWasExecutedAnywhere(plan, call))
-      : missingExpectedCallsForPhase;
+    const missingExpectedCalls = evidenceStatus.missingExpectedCalls;
     if (missingExpectedCalls.length > 0) {
       const missing = missingExpectedCalls.map(formatExpectedCall).join(', ');
       issues.push({
@@ -460,14 +420,7 @@ export function verifyPlanAdherence(plan: AnalysisPlanV3 | null): VerificationIs
       continue;
     }
 
-    const hasExpectations = phase.expectedTools.length > 0;
-    if (matchedCalls.length === 0 && hasExpectations) {
-      if (isConclusionPhase && hasExternalEvidence) {
-        continue;
-      }
-      if (hasReusableComparisonEvidence) {
-        continue;
-      }
+    if (evidenceStatus.missingGenericToolEvidence) {
       issues.push({
         type: 'plan_deviation',
         severity: 'error',
@@ -549,7 +502,14 @@ export function verifySceneCompleteness(
       // Require at least one REAL analysis tool (not just lookup_knowledge which only reads background docs)
       // blocking_chain_analysis/binder_root_cause/jank_frame_detail/surfaceflinger_analysis/frame_production_gap = real deep-drill skills
       // lookup_knowledge is supplementary — counts as evidence only when combined with analysis output patterns
-      const calledSkills = toolCalls.map(call => `${call.toolName} ${call.skillId ?? ''} ${call.inputSummary ?? ''}`).join(' ').toLowerCase();
+      const calledSkills = toolCalls
+        .filter(call =>
+          expectedCallMatchesRecord({tool: 'invoke_skill'}, call) ||
+          expectedCallMatchesRecord({tool: 'compare_skill'}, call),
+        )
+        .map(call => `${call.toolName} ${call.skillId ?? ''} ${call.inputSummary ?? ''}`)
+        .join(' ')
+        .toLowerCase();
       const hasAnalysisTool = /blocking_chain_analysis|binder_root_cause|jank_frame_detail|frame_blocking_calls|surfaceflinger_analysis|frame_production_gap|阻塞链.*(?:唤醒|waker|blocker)|server_dur/i.test(allText) ||
         /jank_frame_detail|frame_blocking_calls|blocking_chain_analysis|binder_root_cause|surfaceflinger_analysis|frame_production_gap/i.test(calledSkills);
       const hasDeepDrill = hasAnalysisTool;

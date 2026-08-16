@@ -3,7 +3,16 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import assert from 'node:assert/strict';
-import {existsSync, readFileSync} from 'node:fs';
+import {spawnSync} from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import test from 'node:test';
 
@@ -45,7 +54,42 @@ test('npm and portable artifacts verify the same backend runtime surfaces', () =
         `'${target}'[\\s\\S]*?required:[\\s\\S]*?node_modules\\/opencode-ai\\/bin\\/opencode\\.exe`,
       ),
     );
+    assert.match(
+      portableVerifier,
+      new RegExp(
+        `'${target}'[\\s\\S]*?required:[\\s\\S]*?node_modules\\/@earendil-works\\/pi-agent-core\\/dist\\/index\\.js[\\s\\S]*?node_modules\\/@earendil-works\\/pi-ai\\/dist\\/index\\.js`,
+      ),
+    );
   }
+});
+
+test('Pi provider-explicit runtime ships exact aligned optional dependencies and a real integration gate', () => {
+  const backendPackage = JSON.parse(readFileSync(join(root, 'backend/package.json'), 'utf8'));
+  assert.equal(
+    backendPackage.optionalDependencies['@earendil-works/pi-agent-core'],
+    '0.84.1',
+  );
+  assert.equal(
+    backendPackage.optionalDependencies['@earendil-works/pi-ai'],
+    '0.84.1',
+  );
+  assert.match(backendPackage.scripts['test:architecture'], /test:pi-provider-runtime/);
+
+  const integrationGate = readFileSync(
+    join(root, 'backend/scripts/check-pi-provider-runtime.cjs'),
+    'utf8',
+  );
+  assert.match(integrationGate, /loadPiAgentCoreModule/);
+  assert.match(integrationGate, /createPiAgentCoreProviderRuntime/);
+  assert.match(integrationGate, /fauxToolCall/);
+  assert.match(integrationGate, /abortAgent\.abort\(\)/);
+  assert.match(integrationGate, /first-secret/);
+  assert.match(integrationGate, /type: 'oauth'/);
+
+  const cliE2e = readFileSync(join(root, 'backend/scripts/run-cli-e2e.cjs'), 'utf8');
+  assert.match(cliE2e, /packed Pi runtime construction/);
+  assert.match(cliE2e, /loadPiAgentCoreModule/);
+  assert.match(cliE2e, /createPiAgentCoreProviderRuntime/);
 });
 
 test('macOS packaging preserves and verifies JIT runtime entitlements', () => {
@@ -132,6 +176,9 @@ test('portable packaging has one launcher implementation and one target-native s
   assert.match(portableScript, /sourceSha256: traceProcessorSourceSha256/);
   assert.match(portableScript, /WINDOWS_MINIMUM_SYSTEM_VERSION="10\.0"/);
   assert.match(portableScript, /node-runtime-pin\.env/);
+  assert.ok(portableScript.includes('D:\\\\SmartPerfettoData'));
+  assert.ok(portableScript.includes('%LOCALAPPDATA%\\\\SmartPerfetto'));
+  assert.match(portableScript, /SMARTPERFETTO_PORTABLE_DATA_DIR/);
   assert.match(
     portableScript,
     /write_readme[\s\\]*"\$package_dir"[\s\\]*"\$target"[\s\\]*"\$PACKAGE_VERSION"[\s\\]*"\$notarized"[\s\\]*"\$macos_minimum_system_version"/,
@@ -146,6 +193,7 @@ test('portable packaging has one launcher implementation and one target-native s
   }
   assert.doesNotMatch(portableScript, /latest-v\$\{NODE_MAJOR\}/);
   assert.doesNotMatch(portableScript, /skip-backend-build/);
+  assert.doesNotMatch(portableScript, /\$version[^\x00-\x7F]/);
   assert.match(portableScript, /prebuild\.name !== expected/);
   assert.match(portableScript, /sign_macos_payloads[\s\S]*packaged_tp_sha[\s\S]*sign_macos_container/);
   assert.match(portableScript, /archive_package_atomically/);
@@ -169,6 +217,8 @@ test('portable packaging has one launcher implementation and one target-native s
   assert.match(windowsContainment, /jobObjectLimitKillOnJobClose/);
   assert.match(windowsContainment, /assignProcessToJobObject/);
   assert.match(portableVerifier, /Windows portable manifest must require Windows 10/);
+  assert.ok(portableVerifier.includes('D:\\\\SmartPerfettoData'));
+  assert.match(portableVerifier, /SMARTPERFETTO_PORTABLE_DATA_DIR/);
   assert.match(
     portableVerifier,
     /README-MACOS\.txt minimum system version does not match the package manifest/,
@@ -182,6 +232,138 @@ test('portable packaging has one launcher implementation and one target-native s
   assert.match(smokeScript, /'-Q'/);
   assert.match(smokeScript, /smartperfetto_smoke=1/);
   assert.match(testingRules, /scripts\/smoke-portable-archive\.cjs/);
+});
+
+test('frontend refresh rejects an incomplete build before modifying the committed target', (t) => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), 'smartperfetto-frontend-refresh-'));
+  t.after(() => rmSync(fixtureRoot, {recursive: true, force: true}));
+
+  const distDir = join(fixtureRoot, 'dist');
+  const versionDir = join(distDir, 'v-test');
+  const frontendDir = join(fixtureRoot, 'frontend');
+  mkdirSync(versionDir, {recursive: true});
+  mkdirSync(frontendDir, {recursive: true});
+  writeFileSync(join(distDir, 'index.html'), '<html></html>\n');
+  writeFileSync(join(versionDir, 'manifest.json'), '{}\n');
+  writeFileSync(join(frontendDir, 'sentinel.txt'), 'preserve me\n');
+
+  const result = spawnSync('bash', [join(root, 'scripts/update-frontend.sh')], {
+    cwd: root,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      SMARTPERFETTO_FRONTEND_DIST_DIR: distDir,
+      SMARTPERFETTO_FRONTEND_DIR: frontendDir,
+    },
+  });
+
+  assert.notEqual(result.status, 0);
+  const output = `${result.stdout}\n${result.stderr}`;
+  assert.match(output, /frontend\.css/);
+  assert.match(output, /cd perfetto && tools\/node ui\/build\.mjs/);
+  assert.equal(readFileSync(join(frontendDir, 'sentinel.txt'), 'utf8'), 'preserve me\n');
+  assert.equal(existsSync(join(frontendDir, 'index.html')), false);
+});
+
+test('frontend refresh derives top-level Syntaqlite assets from the same versioned build', {
+  skip: spawnSync('rsync', ['--version']).status === 0 ? false : 'frontend refresh requires rsync',
+}, (t) => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), 'smartperfetto-frontend-assets-'));
+  t.after(() => rmSync(fixtureRoot, {recursive: true, force: true}));
+
+  const distDir = join(fixtureRoot, 'dist');
+  const versionDir = join(distDir, 'v-test');
+  const versionAssetsDir = join(versionDir, 'assets');
+  const frontendDir = join(fixtureRoot, 'frontend');
+  const frontendAssetsDir = join(frontendDir, 'assets');
+  mkdirSync(versionAssetsDir, {recursive: true});
+  mkdirSync(frontendAssetsDir, {recursive: true});
+  writeFileSync(join(distDir, 'index.html'), '<html><head></head></html>\n');
+  writeFileSync(join(versionDir, 'frontend.css'), 'body {}\n');
+  writeFileSync(join(versionDir, 'frontend_bundle.js'), 'const assets = [];\n');
+  writeFileSync(join(versionDir, 'manifest.json'), '{}\n');
+  writeFileSync(
+    join(versionDir, 'engine_bundle.js'),
+    `"trace_processor.wasm";${'x'.repeat(100_000)}`,
+  );
+  writeFileSync(join(versionDir, 'traceconv_bundle.js'), 'x'.repeat(100_001));
+
+  const assets = [
+    'syntaqlite-perfetto.wasm',
+    'syntaqlite-runtime.js',
+    'syntaqlite-runtime.wasm',
+    'syntaqlite-sqlite.wasm',
+  ];
+  for (const asset of assets) {
+    writeFileSync(join(versionAssetsDir, asset), `fresh-${asset}\n`);
+    writeFileSync(join(frontendAssetsDir, asset), `stale-${asset}\n`);
+  }
+
+  const result = spawnSync('bash', [join(root, 'scripts/update-frontend.sh')], {
+    cwd: root,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      SMARTPERFETTO_FRONTEND_DIST_DIR: distDir,
+      SMARTPERFETTO_FRONTEND_DIR: frontendDir,
+    },
+  });
+
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  for (const asset of assets) {
+    assert.equal(
+      readFileSync(join(frontendAssetsDir, asset), 'utf8'),
+      readFileSync(join(versionAssetsDir, asset), 'utf8'),
+    );
+  }
+});
+
+test('frontend refresh rejects missing Syntaqlite assets before modifying the target', (t) => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), 'smartperfetto-frontend-assets-'));
+  t.after(() => rmSync(fixtureRoot, {recursive: true, force: true}));
+
+  const distDir = join(fixtureRoot, 'dist');
+  const versionDir = join(distDir, 'v-test');
+  const versionAssetsDir = join(versionDir, 'assets');
+  const frontendDir = join(fixtureRoot, 'frontend');
+  mkdirSync(versionAssetsDir, {recursive: true});
+  mkdirSync(frontendDir, {recursive: true});
+  writeFileSync(join(distDir, 'index.html'), '<html><head></head></html>\n');
+  writeFileSync(join(versionDir, 'frontend.css'), 'body {}\n');
+  writeFileSync(join(versionDir, 'frontend_bundle.js'), 'const assets = [];\n');
+  writeFileSync(join(versionDir, 'manifest.json'), '{}\n');
+  writeFileSync(
+    join(versionDir, 'engine_bundle.js'),
+    `"trace_processor.wasm";${'x'.repeat(100_000)}`,
+  );
+  writeFileSync(join(versionDir, 'traceconv_bundle.js'), 'x'.repeat(100_001));
+  for (const asset of [
+    'syntaqlite-perfetto.wasm',
+    'syntaqlite-runtime.js',
+    'syntaqlite-runtime.wasm',
+  ]) {
+    writeFileSync(join(versionAssetsDir, asset), `fresh-${asset}\n`);
+  }
+  writeFileSync(join(frontendDir, 'index.html'), 'preserve-index\n');
+  writeFileSync(join(frontendDir, 'sentinel.txt'), 'preserve-sentinel\n');
+
+  const result = spawnSync('bash', [join(root, 'scripts/update-frontend.sh')], {
+    cwd: root,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      SMARTPERFETTO_FRONTEND_DIST_DIR: distDir,
+      SMARTPERFETTO_FRONTEND_DIR: frontendDir,
+    },
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stdout}\n${result.stderr}`, /syntaqlite-sqlite\.wasm/);
+  assert.equal(readFileSync(join(frontendDir, 'index.html'), 'utf8'), 'preserve-index\n');
+  assert.equal(
+    readFileSync(join(frontendDir, 'sentinel.txt'), 'utf8'),
+    'preserve-sentinel\n',
+  );
 });
 
 test('Docker CI smokes both static routes and the packaged OpenCode executable', () => {
@@ -277,14 +459,43 @@ test('Windows cross-platform contracts build and inject the fixed Go gate helper
     crossPlatform,
     /Verify Windows cross-platform runtime contracts[\s\S]*?npm run test:governance/,
   );
+  assert.match(
+    crossPlatform,
+    /Test and build the Windows portable launcher[\s\S]*?go test \.\/scripts\/portable-launcher[\s\S]*?go build[\s\S]*?\.\/scripts\/portable-launcher/,
+  );
+  assert.match(
+    crossPlatform,
+    /Test Windows Provider secret storage[\s\S]*?localSecretStore\.test\.ts/,
+  );
   assert.doesNotMatch(crossPlatform, /upload-artifact/);
 });
 
-test('manual Deepseek E2E can isolate the source and RAG context matrix', () => {
-  const workflow = readFileSync(
-    join(root, '.github/workflows/agent-deepseek-e2e.yml'),
+test('local Deepseek E2E owns the source and RAG context matrix', () => {
+  assert.equal(
+    existsSync(join(root, '.github/workflows/agent-deepseek-e2e.yml')),
+    false,
+  );
+  const runner = readFileSync(
+    join(root, 'backend/scripts/run-deepseek-agent-e2e.cjs'),
     'utf8',
   );
-  assert.match(workflow, /options:\s+[\s\S]*- context/);
-  assert.match(workflow, /context\)\s+npm run verify:e2e:deepseek-context/);
+  assert.match(
+    runner,
+    /const CONTEXT_SUITE_NAMES = \['context-source', 'context-rag', 'context-combined'\]/,
+  );
+  assert.match(runner, /loadBackendEnv\(\)/);
+  assert.match(runner, /require\('dotenv'\)\.config\(\{ path: envPath, quiet: true \}\)/);
+  const backendPackage = JSON.parse(
+    readFileSync(join(root, 'backend/package.json'), 'utf8'),
+  );
+  for (const scriptName of [
+    'verify:e2e:deepseek',
+    'verify:e2e:deepseek-startup',
+    'verify:e2e:deepseek-scrolling',
+    'verify:e2e:deepseek-external-issue',
+    'verify:e2e:deepseek-dual-trace',
+    'verify:e2e:deepseek-context',
+  ]) {
+    assert.match(backendPackage.scripts[scriptName], /--runtime all-deepseek/);
+  }
 });

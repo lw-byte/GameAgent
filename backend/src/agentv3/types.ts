@@ -414,7 +414,7 @@ export function phaseMatchesCall(phase: PlanPhase, record: ToolCallRecord): bool
   if (record.success === false) return false;
   const shortTool = shortToolName(record.toolName);
   if (!isEvidenceCapableToolName(shortTool)) return false;
-  const expectedToolSet = new Set(phase.expectedTools.map(shortToolName));
+  const expectedToolSet = new Set((phase.expectedTools ?? []).map(shortToolName));
   const structuredCallsForTool = (phase.expectedCalls ?? [])
     .filter(call => shortToolName(call.tool) === shortTool);
   if (structuredCallsForTool.length > 0) {
@@ -437,7 +437,7 @@ export function expectedToolNames(phase: PlanPhase): string[] {
   const structured = (phase.expectedCalls ?? [])
     .map(formatExpectedCall);
   const structuredTools = new Set((phase.expectedCalls ?? []).map(c => shortToolName(c.tool)));
-  const generic = phase.expectedTools
+  const generic = (phase.expectedTools ?? [])
     .map(shortToolName)
     .filter(tool => !structuredTools.has(tool));
   return [...structured, ...generic];
@@ -600,15 +600,15 @@ export type HypothesisStatus = 'formed' | 'confirmed' | 'rejected';
 
 /** A structured hypothesis formed during analysis that must be resolved before concluding. */
 export interface Hypothesis {
-  id: string;
-  /** The hypothesis statement (e.g., "RenderThread blocked by Binder causing jank") */
-  statement: string;
+  readonly id: string;
+  /** Immutable claim whose original causal meaning is resolved by status. */
+  readonly statement: string;
   status: HypothesisStatus;
   /** What observation or data prompted this hypothesis */
   basis?: string;
   /** Evidence for confirmation/rejection */
   evidence?: string;
-  formedAt: number;
+  readonly formedAt: number;
   resolvedAt?: number;
 }
 

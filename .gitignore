@@ -38,6 +38,7 @@ target/
 *.db-wal
 backend/data/sessions/*.db
 backend/data/sessions.db
+backend/data/providers.json.generations.db
 
 # Uploaded trace files (user data, not needed in repo)
 backend/uploads/*
@@ -89,6 +90,7 @@ coverage/
 .parcel-cache
 .npm
 .eslintcache
+__pycache__/
 
 # Temporary
 tmp/
@@ -125,6 +127,7 @@ test-output/
 # Playwright MCP (screenshots, recordings)
 # ===================
 .playwright-mcp/
+.playwright-cli/
 
 # ===================
 # Feature development notes (personal)
@@ -190,3 +193,6 @@ providers.json
 # Trace corpus private staging and materialized constructed outputs
 /Trace/real/.private/
 /Trace/.generated/
+
+# Local research dumps, screenshots, and raw trace files (never commit)
+references/

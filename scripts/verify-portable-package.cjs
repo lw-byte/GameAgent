@@ -45,6 +45,7 @@ const TARGETS = {
     required: [
       'PACKAGE-MANIFEST.json',
       'README-WINDOWS.txt',
+      'README-WINDOWS.zh-CN.txt',
       'SmartPerfetto.exe',
       'runtime/node/node.exe',
       'bin/trace_processor_shell.exe',
@@ -59,14 +60,18 @@ const TARGETS = {
       'frontend/index.html',
       'frontend/server.js',
       'backend/node_modules/better-sqlite3/build/Release/better_sqlite3.node',
+      'backend/node_modules/sodium-native/prebuilds/win32-x64/sodium-native.node',
       'backend/node_modules/@anthropic-ai/claude-agent-sdk-win32-x64/claude.exe',
       'backend/node_modules/opencode-ai/bin/opencode.exe',
+      'backend/node_modules/@earendil-works/pi-agent-core/dist/index.js',
+      'backend/node_modules/@earendil-works/pi-ai/dist/index.js',
     ],
     binaryRequired: [
       'SmartPerfetto.exe',
       'runtime/node/node.exe',
       'bin/trace_processor_shell.exe',
       'backend/node_modules/better-sqlite3/build/Release/better_sqlite3.node',
+      'backend/node_modules/sodium-native/prebuilds/win32-x64/sodium-native.node',
       'backend/node_modules/@anthropic-ai/claude-agent-sdk-win32-x64/claude.exe',
       'backend/node_modules/opencode-ai/bin/opencode.exe',
     ],
@@ -103,6 +108,8 @@ const TARGETS = {
       'SmartPerfetto.app/Contents/Resources/backend/node_modules/better-sqlite3/build/Release/better_sqlite3.node',
       'SmartPerfetto.app/Contents/Resources/backend/node_modules/@anthropic-ai/claude-agent-sdk-darwin-arm64/claude',
       'SmartPerfetto.app/Contents/Resources/backend/node_modules/opencode-ai/bin/opencode.exe',
+      'SmartPerfetto.app/Contents/Resources/backend/node_modules/@earendil-works/pi-agent-core/dist/index.js',
+      'SmartPerfetto.app/Contents/Resources/backend/node_modules/@earendil-works/pi-ai/dist/index.js',
     ],
     binaryRequired: [
       'SmartPerfetto.app/Contents/MacOS/SmartPerfetto',
@@ -143,6 +150,8 @@ const TARGETS = {
       'backend/node_modules/better-sqlite3/build/Release/better_sqlite3.node',
       'backend/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude',
       'backend/node_modules/opencode-ai/bin/opencode.exe',
+      'backend/node_modules/@earendil-works/pi-agent-core/dist/index.js',
+      'backend/node_modules/@earendil-works/pi-ai/dist/index.js',
     ],
     binaryRequired: [
       'SmartPerfetto',
@@ -1389,11 +1398,34 @@ function main() {
   const readme = readExtractedText(extractedRoot, `${packageName}/${target.readme}`);
   assert(readme.includes(`Version: ${version}`), `${target.readme} does not contain the package version`);
   if (target.os === 'windows') {
+    const readmeZh = readExtractedText(
+      extractedRoot,
+      `${packageName}/README-WINDOWS.zh-CN.txt`,
+    );
     assert(
-      readme.includes('%LOCALAPPDATA%\\SmartPerfetto') &&
+      readme.includes('D:\\SmartPerfettoData') &&
+        readme.includes('%LOCALAPPDATA%\\SmartPerfetto') &&
+        readme.includes('SMARTPERFETTO_PORTABLE_DATA_DIR') &&
+        readme.includes('fixed local drive') &&
+        readme.includes('never merges into or') &&
         readme.includes('--migrate-from') &&
-        readme.includes('SMARTPERFETTO_PORTABLE_MODE=1'),
+        readme.includes('SMARTPERFETTO_PORTABLE_MODE=1') &&
+        readme.includes('Get-FileHash') &&
+        readme.includes('Ctrl+C') &&
+        readme.includes('docs/getting-started/windows.en.md'),
       'README-WINDOWS.txt is missing durable data or migration instructions',
+    );
+    assert(
+      readmeZh.includes(`版本：${version}`) &&
+        readmeZh.includes('D:\\SmartPerfettoData') &&
+        readmeZh.includes('%LOCALAPPDATA%\\SmartPerfetto') &&
+        readmeZh.includes('SMARTPERFETTO_PORTABLE_DATA_DIR') &&
+        readmeZh.includes('本地固定磁盘') &&
+        readmeZh.includes('绝不合并或覆盖') &&
+        readmeZh.includes('Get-FileHash') &&
+        readmeZh.includes('Ctrl+C') &&
+        readmeZh.includes('docs/getting-started/windows.md'),
+      'README-WINDOWS.zh-CN.txt is missing the Windows quick-start contract',
     );
   }
   if (target.os === 'macos') {

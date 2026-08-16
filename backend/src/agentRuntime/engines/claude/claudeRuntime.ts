@@ -59,6 +59,7 @@ import {
   hasConfiguredClaudeEffortOverride,
   isClaudeQuotaError,
   loadClaudeConfig,
+  resolveClaudeSdkPermissionOptions,
   resolveEffort,
   resolveRuntimeConfig,
   type ClaudeAgentConfig,
@@ -80,7 +81,10 @@ import {
 } from '../../../services/resolvedAnalysisContext';
 import type { AnalysisNote, AnalysisPlanV3, ClaudeAnalysisContext, ComplexityClassifierInput, FailedApproach, Hypothesis, QueryComplexity, TraceCompleteness, UncertaintyFlag, VerificationIssue } from '../../../agentv3/types';
 import { ArtifactStore } from '../../../agentv3/artifactStore';
-import { recordPlanOrPrePlanToolCall } from '../../../agentv3/planToolCallRecorder';
+import {
+  recordPlanOrPrePlanToolCall,
+  resetPrePlanToolCallsForNewRun,
+} from '../../../agentv3/planToolCallRecorder';
 import { buildRecoveryNote } from '../../../agentv3/recoveryNoteBuilder';
 import { evaluateThreshold as evaluateContextThreshold } from '../../../agentv3/contextTokenMeter';
 import {
@@ -123,6 +127,12 @@ import {
 import { buildRuntimeCaseBackgroundContext } from '../../../services/caseEvolution/caseBackgroundContext';
 import { getProductionEngineCapabilities } from '../../runtimeDescriptors';
 import type { EngineCapabilities } from '../../runtimeDescriptorTypes';
+import {
+  createResettableRuntimeTimeout,
+  resolveFullRequestTimeoutMs,
+  summarizeExternalToolResult,
+  type RuntimeTimeoutKind,
+} from '../../runtimeLimits';
 import { buildFocusAppEvidencePayload } from '../../focusAppEvidence';
 import {
   buildRuntimeQuickEvidenceDirectAnswer,
@@ -689,7 +699,23 @@ function buildClaudeSdkSystemPrompt(
 }
 
 function projectClaudeToolResultForPlan(toolName: string, result: unknown): string {
-  return stringifySdkToolResult(projectToolResultForExternalSurface(toolName, result));
+  return summarizeExternalToolResult(projectToolResultForExternalSurface(toolName, result));
+}
+
+function buildClaudeSdkToolOptions(
+  allowedTools: readonly string[],
+  agents?: Record<string, unknown>,
+): {tools: string[]; allowedTools: string[]} {
+  const hasSubAgents = agents !== undefined && Object.keys(agents).length > 0;
+  if (!hasSubAgents) {
+    return {tools: [], allowedTools: [...allowedTools]};
+  }
+  return {
+    tools: ['Agent'],
+    allowedTools: allowedTools.includes('Agent')
+      ? [...allowedTools]
+      : [...allowedTools, 'Agent'],
+  };
 }
 
 export const __testing = {
@@ -710,6 +736,7 @@ export const __testing = {
   projectClaudeToolResultForPlan,
   recoverClaudeInterruptedFinalReport,
   isRecoverableClaudeStreamInterruption,
+  buildClaudeSdkToolOptions,
 };
 
 /** Sleep for the given milliseconds. */
@@ -803,6 +830,7 @@ function sdkQueryWithRetry(
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (closed) return;
       const attemptStartedAt = Date.now();
+      let terminalResultObserved = false;
       try {
         if (currentEvaluationInjectionContract()) {
           commitEvaluationExposureSince(0, 'sdk_handoff_observed');
@@ -812,6 +840,10 @@ function sdkQueryWithRetry(
         // Yield all messages from the stream
         for await (const msg of currentQuery) {
           if (closed) return;
+          if ((msg as any)?.type === 'result') {
+            const subtype = (msg as any).subtype;
+            terminalResultObserved = subtype === 'success' || isSdkMaxTurnsSubtype(subtype);
+          }
           yield msg;
         }
         successful = true;
@@ -819,6 +851,13 @@ function sdkQueryWithRetry(
         return; // Success — exit generator
       } catch (err) {
         lastErr = err as Error;
+        if (terminalResultObserved) {
+          console.warn(
+            '[ClaudeRuntime] Ignoring SDK iterator cleanup error after terminal result:',
+            diagnosticLogIdentity(lastErr.message),
+          );
+          return;
+        }
         // If the caller invoked close(), treat the resulting error as
         // intentional termination rather than a retryable failure.
         if (closed) return;
@@ -1079,6 +1118,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       streamStarted: boolean;
       getAccumulatedAnswer: () => string;
       flushPendingAnswer: () => void;
+      dispose: () => void;
       getPlan: () => AnalysisPlanV3 | null;
     } | undefined;
 
@@ -1109,6 +1149,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         : resolvedRuntimeConfig;
       outputLanguage = runtimeConfig.outputLanguage;
       const emptyFocusResult = { apps: [], primaryApp: undefined, method: 'none' as const };
+      const conversationSurface = options.assistantSurface === 'conversation';
       let focusPromise: Promise<Awaited<ReturnType<typeof detectFocusApps>>> | undefined;
       const startFocusDetection = () => {
         focusPromise ??= detectFocusApps(this.traceProcessorService, traceId, {
@@ -1140,7 +1181,8 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       });
       const localQuickProcessIdentityPreEvidence = localQuickPreEvidenceFlags.quickProcessIdentityPreEvidence;
       const localQuickTraceFactPreEvidence = localQuickPreEvidenceFlags.quickTraceFactPreEvidence;
-      const localCanSkipFocusDetection = localQuickPreEvidenceFlags.skipFocusDetection;
+      const localCanSkipFocusDetection =
+        conversationSurface || localQuickPreEvidenceFlags.skipFocusDetection;
       if (!localCanSkipFocusDetection) {
         if (!localQuickAcknowledgementDirectAnswer) {
           startFocusDetection();
@@ -1199,6 +1241,16 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         skipQuickTracePreflightDetection = (
           quickProcessIdentityPreEvidence || quickTraceFactPreEvidence
         );
+      }
+
+      if (conversationSurface) {
+        quickAcknowledgementDirectAnswer = false;
+        quickFocusAppPreEvidence = false;
+        quickProcessIdentityPreEvidence = false;
+        quickTraceFactPreEvidence = false;
+        quickScrollingTriagePreEvidence = false;
+        quickSkipFocusDetection = true;
+        skipQuickTracePreflightDetection = true;
       }
 
       const analysisRunSpec = createAnalysisRunSpec({
@@ -1325,6 +1377,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         handleMessage: bridge,
         getAccumulatedAnswer,
         flushPendingAnswer,
+        dispose: disposeBridge,
       } = createSseBridge((update: StreamingUpdate) => {
         const normalizedUpdate = normalizeClaudeBridgeConclusionUpdate(
           update,
@@ -1356,6 +1409,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         streamStarted: false,
         getAccumulatedAnswer,
         flushPendingAnswer,
+        dispose: disposeBridge,
         getPlan: () => ctx.analysisPlan.current,
       };
 
@@ -1420,12 +1474,10 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
           mcpServers: { smartperfetto: ctx.mcpServer },
           includePartialMessages: true,
           settingSources: [],
-          tools: [],
-          permissionMode: 'bypassPermissions' as const,
-          allowDangerouslySkipPermissions: true,
+          ...buildClaudeSdkToolOptions(ctx.allowedTools, ctx.agents),
+          ...resolveClaudeSdkPermissionOptions(),
           cwd: runtimeConfig.cwd,
           effort: ctx.effectiveEffort,
-          allowedTools: ctx.allowedTools,
           env: sdkEnv,
           persistSession: !privateAnalysisContext,
           stderr: (data: string) => {
@@ -1452,8 +1504,13 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       // Per-turn budget is env-configurable (CLAUDE_FULL_PER_TURN_MS, default 60s) so slower
       // LLMs (DeepSeek / Ollama / GLM) have room per turn without false timeouts.
       // Scrolling deep-drill (hypothesis + SQL + knowledge + conclusion) still needs ~6-8 min.
-      const timeoutMs = (runtimeConfig.maxTurns || 15) * runtimeConfig.fullPathPerTurnMs;
+      const timeoutMs = resolveFullRequestTimeoutMs(
+        runtimeConfig.fullPathPerTurnMs,
+        runtimeConfig.maxTurns || 15,
+        runtimeConfig.fullRequestTimeoutMs,
+      );
       let timedOut = false;
+      const timeoutState: {kind: RuntimeTimeoutKind} = {kind: 'request'};
 
       // Sub-agent timeout tracking — stop tasks that exceed subAgentTimeoutMs
       const activeSubAgentTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
@@ -1469,6 +1526,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         startTime?: number;
         input?: unknown;
       }> = [];
+      const MAX_TOOL_CALL_HISTORY = 100;
       const WATCHDOG_WINDOW = 3; // consecutive same-tool failures to trigger warning
       const watchdogFiredTools = new Set<string>(); // tracks which tools have triggered warnings
 
@@ -1580,6 +1638,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       const processStream = async () => {
         for await (const msg of stream) {
           if (timedOut) break; // P0-1: Actually cancel stream on timeout
+          providerIdleTimeout.reset();
           if (interruptionRecoveryState) interruptionRecoveryState.streamStarted = true;
 
           // Detect SDK auto-compact boundary — conversation history was summarized
@@ -1712,6 +1771,12 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
                   startTime: Date.now(),
                   input: block.input,
                 });
+                if (toolCallHistory.length > MAX_TOOL_CALL_HISTORY) {
+                  toolCallHistory.shift();
+                  if (Number.isFinite(lastCircuitBreakerFireIdx)) {
+                    lastCircuitBreakerFireIdx--;
+                  }
+                }
               }
             }
             currentTurnMetrics = {
@@ -1911,9 +1976,19 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       };
 
       let safetyTimer: ReturnType<typeof setTimeout> | undefined;
+      const providerIdleTimeout = createResettableRuntimeTimeout({
+        timeoutMs: runtimeConfig.streamIdleTimeoutMs,
+        message: `Claude provider stream idle timeout after ${runtimeConfig.streamIdleTimeoutMs}ms`,
+        onTimeout: () => {
+          timedOut = true;
+          timeoutState.kind = 'stream_idle';
+          closeSdk();
+        },
+      });
       const timeoutPromise = new Promise<void>((_, reject) => {
         safetyTimer = setTimeout(() => {
           timedOut = true;
+          timeoutState.kind = 'request';
           // Forcefully terminate the SDK subprocess — without this, queued
           // MCP tool calls (e.g. execute_sql) keep executing in the background
           // after the session logger has closed, producing orphan SQL errors.
@@ -1923,7 +1998,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       });
 
       try {
-        await Promise.race([processStream(), timeoutPromise]);
+        await Promise.race([processStream(), timeoutPromise, providerIdleTimeout.promise]);
       } catch (err) {
         if (timedOut) {
           console.error('[ClaudeRuntime] Analysis safety timeout reached — SDK subprocess has been closed');
@@ -1946,11 +2021,28 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         }
       } finally {
         if (safetyTimer) clearTimeout(safetyTimer);
+        providerIdleTimeout.clear();
         closeSdk();
         unregisterSdkAbortHandle();
       }
 
-      if (missingSdkConversationError && existingSdkSessionId) {
+      if (timedOut) {
+        terminationReason = 'timeout';
+        terminationMessage = timeoutState.kind === 'stream_idle'
+          ? localize(
+            outputLanguage,
+            `AI provider 连续 ${Math.round(runtimeConfig.streamIdleTimeoutMs / 1000)} 秒没有流事件，已取消并保留部分结果。`,
+            `The AI provider emitted no stream events for ${Math.round(runtimeConfig.streamIdleTimeoutMs / 1000)} seconds; the run was cancelled and partial results were preserved.`,
+          )
+          : localize(
+            outputLanguage,
+            `完整分析超过 ${Math.round(timeoutMs / 1000)} 秒硬上限，已取消并保留部分结果。`,
+            `Full analysis exceeded the ${Math.round(timeoutMs / 1000)} second hard limit; the run was cancelled and partial results were preserved.`,
+          );
+        flushPendingAnswer();
+      }
+
+      if (!timedOut && missingSdkConversationError && existingSdkSessionId) {
         delegatedRetry = true;
         return await this.retryWithoutSdkResume({
           query,
@@ -1963,7 +2055,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
           outputLanguage,
         });
       }
-      if (sdkStreamErrorMessage) {
+      if (sdkStreamErrorMessage && !timedOut) {
         throw new Error(sdkStreamErrorMessage);
       }
 
@@ -2053,7 +2145,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       // and conclusion-length checks must fire even when zero findings are extracted.
       console.log(`[ClaudeRuntime] Pre-verification: conclusionText=${conclusionText.length} chars, sdkSessionId=${sdkSessionId ? 'set' : 'MISSING'}, enableVerification=${runtimeConfig.enableVerification}`);
       let verificationDegradedMessage: string | undefined;
-      if (runtimeConfig.enableVerification || privateAnalysisContext) {
+      if (!timedOut && (runtimeConfig.enableVerification || privateAnalysisContext)) {
         const MAX_CORRECTION_ATTEMPTS = 2;
         let previousErrorSignatures = new Set<string>();
 
@@ -2168,8 +2260,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
                   includePartialMessages: true,
                   settingSources: [],
                   tools: [],
-                  permissionMode: 'bypassPermissions' as const,
-                  allowDangerouslySkipPermissions: true,
+                  ...resolveClaudeSdkPermissionOptions(),
                   cwd: runtimeConfig.cwd,
                   effort: ctx.effectiveEffort,
                   allowedTools: [],
@@ -2227,12 +2318,13 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
                 // closed on every exit (success, break, throw). Idempotent.
                 closeCorrection();
                 unregisterCorrectionAbortHandle();
-              }
-              if (!correctionTimedOut) {
-                correctionAnswerBridge.flushPendingAnswer();
-              }
-              if (!correctedResult && !correctionTimedOut) {
-                correctedResult = correctionAnswerBridge.getAccumulatedAnswer();
+                if (!correctionTimedOut) {
+                  correctionAnswerBridge.flushPendingAnswer();
+                }
+                if (!correctedResult && !correctionTimedOut) {
+                  correctedResult = correctionAnswerBridge.getAccumulatedAnswer();
+                }
+                correctionAnswerBridge.dispose();
               }
               correctedResult = ensureClaudeFinalReportHeading(
                 correctedResult,
@@ -2307,7 +2399,8 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         runtimeConfig.outputLanguage,
       );
 
-      const isPartialResult = terminationReason === MAX_TURNS_TERMINATION_REASON;
+      const isPartialResult =
+        terminationReason === MAX_TURNS_TERMINATION_REASON || terminationReason === 'timeout';
       if (isPartialResult) {
         const recoveredConclusion = recoverClaudeInterruptedFinalReport({
           accumulatedAnswer: conclusionText,
@@ -2322,33 +2415,60 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
             runtimeConfig.outputLanguage,
           );
         }
-        terminationMessage ||= buildMaxTurnsTerminationMessage({
-          mode: 'full',
-          turns: rounds,
-          maxTurns: runtimeConfig.maxTurns,
-          outputLanguage: runtimeConfig.outputLanguage,
-        });
+        if (terminationReason === MAX_TURNS_TERMINATION_REASON) {
+          terminationMessage ||= buildMaxTurnsTerminationMessage({
+            mode: 'full',
+            turns: rounds,
+            maxTurns: runtimeConfig.maxTurns,
+            outputLanguage: runtimeConfig.outputLanguage,
+          });
+        }
+        terminationMessage ||= localize(
+          runtimeConfig.outputLanguage,
+          '完整分析超时，以下仅保留超时前已收集的部分结果。',
+          'Full analysis timed out; only partial results collected before the timeout are retained below.',
+        );
         conclusionText = conclusionText.trim()
           ? prependPartialNotice(conclusionText, terminationMessage, runtimeConfig.outputLanguage)
-          : buildMaxTurnsFallbackConclusion({
-              mode: 'full',
-              turns: rounds,
-              maxTurns: runtimeConfig.maxTurns,
-              outputLanguage: runtimeConfig.outputLanguage,
-            });
+          : terminationReason === MAX_TURNS_TERMINATION_REASON
+            ? buildMaxTurnsFallbackConclusion({
+                mode: 'full',
+                turns: rounds,
+                maxTurns: runtimeConfig.maxTurns,
+                outputLanguage: runtimeConfig.outputLanguage,
+              })
+            : ensureClaudeFinalReportHeading(
+                localize(
+                  runtimeConfig.outputLanguage,
+                  `## 综合结论\n\n${terminationMessage}\n\n## 关键证据链\n\n- 超时前没有形成可安全交付的完整证据链。`,
+                  `## Overall Conclusion\n\n${terminationMessage}\n\n## Key Evidence Chain\n\n- No complete evidence chain was safe to deliver before the timeout.`,
+                ),
+                ctx.sceneType,
+                runtimeConfig.outputLanguage,
+              );
         allFindings.push(extractFindingsFromText(conclusionText));
         mergedFindings = mergeFindings(allFindings);
-        failedApproaches.push({
-          type: 'strategy_failure',
-          approach: `analysis reached ${runtimeConfig.maxTurns} full-mode turns`,
-          reason: 'SDK returned error_max_turns before a normal success result',
-        });
+        failedApproaches.push(terminationReason === MAX_TURNS_TERMINATION_REASON
+          ? {
+              type: 'strategy_failure',
+              approach: `analysis reached ${runtimeConfig.maxTurns} full-mode turns`,
+              reason: 'SDK returned error_max_turns before a normal success result',
+            }
+          : {
+              type: 'strategy_failure',
+              approach: `analysis exceeded ${timeoutState.kind === 'stream_idle' ? 'provider stream idle' : 'request'} timeout`,
+              reason: 'SDK stream was cancelled before a normal success result',
+            });
         this.emitUpdate({
           type: 'degraded',
           content: {
             module: 'claudeRuntime',
-            fallback: 'partial_result_after_max_turns',
-            error: SDK_MAX_TURNS_SUBTYPE,
+            fallback: terminationReason === MAX_TURNS_TERMINATION_REASON
+              ? 'partial_result_after_max_turns'
+              : 'partial_result_after_timeout',
+            ...(terminationReason === MAX_TURNS_TERMINATION_REASON
+              ? {error: SDK_MAX_TURNS_SUBTYPE}
+              : {timeoutKind: timeoutState.kind}),
             message: terminationMessage,
             partial: true,
             terminationReason,
@@ -2696,6 +2816,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         terminationMessage: errMsg,
       };
     } finally {
+      interruptionRecoveryState?.dispose();
       this.activeAnalyses.delete(sessionId);
       runSnapshots.release(sessionId);
       // Notes persistence now handled by unified SessionStateSnapshot in the route layer.
@@ -2922,7 +3043,8 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       };
 
       const skipQuickPreflightForEvidence = skipQuickTracePreflightDetection || quickFocusAppPreEvidence;
-      const skipQuickPreflight = skipQuickPreflightForEvidence;
+      const deferQuickTracePreflightToModel = options.assistantSurface === 'conversation';
+      const skipQuickPreflight = skipQuickPreflightForEvidence || deferQuickTracePreflightToModel;
       const architecturePromise = skipQuickPreflight
         ? Promise.resolve(undefined)
         : detectQuickArchitecture();
@@ -3007,7 +3129,11 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         && (!quickProcessIdentityPreEvidence || useProcessIdentityEvidenceOnlyQuick)
         && (!quickTraceFactPreEvidence || useTraceFactEvidenceOnlyQuick);
 
-      if (skipQuickPreflightForEvidence && !useEvidenceOnlyQuick) {
+      if (
+        skipQuickPreflightForEvidence &&
+        !deferQuickTracePreflightToModel &&
+        !useEvidenceOnlyQuick
+      ) {
         architecture = await detectQuickArchitecture();
         sqlErrors = ensureSqlErrorsLoaded();
       }
@@ -3139,6 +3265,9 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
           watchdogWarning,
           sceneType,
           lightweight: true,
+          conversationTraceAttached: options.assistantSurface === 'conversation'
+            ? options.conversationTraceAttached === true
+            : undefined,
           artifactStore: quickArtifactStore,
           recentSqlErrors: sqlErrors,
           skillNotesBudget: quickNotesBudget,
@@ -3169,7 +3298,12 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       });
       const quickConversationContext = buildQuickConversationContext(previousTurns, outputLanguage);
 
-      const { handleMessage: bridge, getAccumulatedAnswer } = createSseBridge((update: StreamingUpdate) => {
+      const {
+        handleMessage: bridge,
+        getAccumulatedAnswer,
+        flushPendingAnswer,
+        dispose: disposeBridge,
+      } = createSseBridge((update: StreamingUpdate) => {
         this.emitUpdate(update);
       }, outputLanguage, {
         tracePairContext: options.tracePairContext,
@@ -3214,8 +3348,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
           includePartialMessages: true,
           settingSources: [],
           tools: [],
-          permissionMode: 'bypassPermissions' as const,
-          allowDangerouslySkipPermissions: true,
+          ...resolveClaudeSdkPermissionOptions(),
           cwd: quickConfig.cwd,
           effort: quickConfig.effort,
           allowedTools,
@@ -3234,6 +3367,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       const unregisterSdkAbortHandle = this.registerAbortHandle(sessionId, { abort: closeSdk });
 
       let finalResult: string | undefined;
+      let accumulatedAnswerAfterStream = '';
       let quickRounds = 0;
       let terminationReason: AnalysisResult['terminationReason'];
       let terminationMessage: string | undefined;
@@ -3292,6 +3426,9 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         if (safetyTimer) clearTimeout(safetyTimer);
         closeSdk();
         unregisterSdkAbortHandle();
+        flushPendingAnswer();
+        accumulatedAnswerAfterStream = getAccumulatedAnswer();
+        disposeBridge();
       }
 
       if (timedOut) {
@@ -3303,7 +3440,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         );
       }
 
-      let conclusionText = finalResult || getAccumulatedAnswer() || '';
+      let conclusionText = finalResult || accumulatedAnswerAfterStream || '';
       let mergedFindings = mergeFindings([extractFindingsFromText(conclusionText)]);
       const isPartialResult = terminationReason === MAX_TURNS_TERMINATION_REASON || terminationReason === 'timeout';
       if (isPartialResult) {
@@ -4005,6 +4142,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
     }
     const previousPlan = analysisPlan.current ?? undefined;
     analysisPlan.current = null;
+    resetPrePlanToolCallsForNewRun(analysisPlan);
 
     // Phase 6.6: Watchdog feedback ref — shared between runtime watchdog and MCP tools
     const watchdogWarning: { current: string | null } = { current: null };
@@ -4041,6 +4179,9 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
     // P2-G1: Destructure to get both server and auto-derived allowedTools
     const fullNotesBudget = createRuntimeSkillNotesBudget(false);
     const { server: mcpServer, allowedTools } = createClaudeMcpServer({
+      conversationTraceAttached: options.assistantSurface === 'conversation'
+        ? options.conversationTraceAttached === true
+        : undefined,
       runManifestAttributionSink: options.runManifestAttributionSink,
       sessionId,
       traceId,

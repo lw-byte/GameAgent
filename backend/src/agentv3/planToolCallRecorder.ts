@@ -13,6 +13,10 @@ import {
   type PlanPhase,
   type ToolCallRecord,
 } from './types';
+import {
+  isComparisonSynthesisPlanPhase,
+  isConclusionLikePlanPhase,
+} from './planPhaseSemantics';
 import { summarizeToolCallInput } from './toolCallSummary';
 import {
   getSourceLookupCodeReferences,
@@ -40,10 +44,25 @@ export interface AnalysisPlanTracker {
   prePlanToolCallLog?: ToolCallRecord[];
 }
 
+export function resetPrePlanToolCallsForNewRun(
+  tracker: AnalysisPlanTracker | null | undefined,
+): void {
+  if (tracker) tracker.prePlanToolCallLog = [];
+}
+
 export interface PlanEvidenceGap {
   phase: PlanPhase;
   matchedCalls: ToolCallRecord[];
   missingExpectedCalls: ExpectedCall[];
+  /** True when a legacy expectedTools-only phase has no valid call attributed to it. */
+  missingGenericToolEvidence?: boolean;
+}
+
+export interface PhaseToolEvidenceStatus {
+  satisfied: boolean;
+  matchedCalls: ToolCallRecord[];
+  missingExpectedCalls: ExpectedCall[];
+  missingGenericToolEvidence: boolean;
 }
 
 function shortToolName(toolName: string): string {
@@ -176,14 +195,18 @@ export function recordPlanToolCall(
   const canSatisfyEvidence = isEvidenceCapableToolName(shortName);
   const candidate = buildToolCallRecord(input);
 
-  const expectedGapPhase = canSatisfyEvidence ? findBestPhaseForExpectedCallGap(plan, candidate) : undefined;
+  const expectedGapPhase = canSatisfyEvidence
+    ? findBestPhaseForExpectedCallGap(plan, candidate, 'structured_only')
+    : undefined;
   const toolReturnedPhaseId = extractPlanPhaseIdFromToolResult(input.resultText);
   let matchedPhaseId = expectedGapPhase?.id;
 
   if (!matchedPhaseId && canSatisfyEvidence) {
-    matchedPhaseId = toolReturnedPhaseId &&
-      plan.phases.some(p => p.id === toolReturnedPhaseId)
-      ? toolReturnedPhaseId
+    const returnedPhase = toolReturnedPhaseId
+      ? plan.phases.find(phase => phase.id === toolReturnedPhaseId)
+      : undefined;
+    matchedPhaseId = returnedPhase && phaseMatchesCall(returnedPhase, candidate)
+      ? returnedPhase.id
       : undefined;
   }
 
@@ -194,10 +217,10 @@ export function recordPlanToolCall(
     }
   }
   if (!matchedPhaseId && canSatisfyEvidence) {
-    const pendingMatch = plan.phases.find(p =>
+    const pendingMatches = plan.phases.filter(p =>
       p.status === 'pending' && phaseMatchesCall(p, candidate),
     );
-    matchedPhaseId = pendingMatch?.id;
+    matchedPhaseId = pendingMatches.length === 1 ? pendingMatches[0].id : undefined;
   }
 
   const record = { ...candidate, matchedPhaseId };
@@ -243,7 +266,11 @@ export function replayPrePlanToolCalls(tracker: AnalysisPlanTracker | null | und
 
   let replayed = 0;
   for (const candidate of prePlanToolCallLog) {
-    const matchedPhase = findBestPhaseForExpectedCallGap(plan, candidate);
+    const matchedPhase = findBestPhaseForExpectedCallGap(
+      plan,
+      candidate,
+      'structured_or_generic',
+    );
     if (!matchedPhase) continue;
     plan.toolCallLog.push({
       ...candidate,
@@ -271,16 +298,112 @@ export function findMissingExpectedCallsForPhase(
     .filter(call => !matchedCalls.some(record => expectedCallMatchesRecord(call, record)));
 }
 
+function expectedCallWasExecutedAnywhere(
+  toolCallLog: readonly ToolCallRecord[],
+  expectedCall: ExpectedCall,
+): boolean {
+  return toolCallLog.some(record => expectedCallMatchesRecord(expectedCall, record));
+}
+
+function hasNonConclusionPhaseToolEvidence(
+  plan: AnalysisPlanV3,
+  conclusionPhaseId: string,
+  toolCallLog: readonly ToolCallRecord[],
+): boolean {
+  const phaseById = new Map(plan.phases.map(phase => [phase.id, phase]));
+  return toolCallLog.some(record => {
+    if (!record.matchedPhaseId || record.matchedPhaseId === conclusionPhaseId) return false;
+    const matchedPhase = phaseById.get(record.matchedPhaseId);
+    return Boolean(
+      matchedPhase &&
+      !isConclusionLikePlanPhase(matchedPhase) &&
+      phaseMatchesCall(matchedPhase, record),
+    );
+  });
+}
+
+function hasPriorNonConclusionMatchingToolEvidence(
+  plan: AnalysisPlanV3,
+  phase: PlanPhase,
+  toolCallLog: readonly ToolCallRecord[],
+): boolean {
+  const phaseById = new Map(plan.phases.map(entry => [entry.id, entry]));
+  const phaseIndex = plan.phases.findIndex(entry => entry.id === phase.id);
+  return toolCallLog.some(record => {
+    if (!record.matchedPhaseId || record.matchedPhaseId === phase.id) return false;
+    const matchedPhase = phaseById.get(record.matchedPhaseId);
+    if (
+      !matchedPhase ||
+      isConclusionLikePlanPhase(matchedPhase) ||
+      !phaseMatchesCall(matchedPhase, record)
+    ) {
+      return false;
+    }
+    if (phaseIndex >= 0) {
+      const matchedIndex = plan.phases.findIndex(entry => entry.id === matchedPhase.id);
+      if (matchedIndex > phaseIndex) return false;
+    }
+    return phaseMatchesCall(phase, record);
+  });
+}
+
+/**
+ * Single source of truth for whether a phase has fulfilled its tool-evidence
+ * contract. Structured calls are exact requirements; legacy expectedTools
+ * require at least one valid call attributed to the phase. A pure conclusion
+ * phase may reuse valid evidence from an earlier non-conclusion phase.
+ */
+export function getPhaseToolEvidenceStatus(
+  plan: AnalysisPlanV3,
+  phase: PlanPhase,
+  toolCallLog: readonly ToolCallRecord[] = plan.toolCallLog,
+): PhaseToolEvidenceStatus {
+  const matchedCalls = toolCallLog.filter(record =>
+    record.matchedPhaseId === phase.id && phaseMatchesCall(phase, record),
+  );
+  const missingForPhase = findMissingExpectedCallsForPhase(phase, toolCallLog);
+  const conclusionLike = isConclusionLikePlanPhase(phase);
+  const missingExpectedCalls = conclusionLike
+    ? missingForPhase.filter(call => !expectedCallWasExecutedAnywhere(toolCallLog, call))
+    : missingForPhase;
+
+  const hasReusableConclusionEvidence = conclusionLike &&
+    hasNonConclusionPhaseToolEvidence(plan, phase.id, toolCallLog);
+  const hasReusableComparisonEvidence = isComparisonSynthesisPlanPhase(phase) &&
+    hasPriorNonConclusionMatchingToolEvidence(plan, phase, toolCallLog);
+  const missingGenericToolEvidence = missingExpectedCalls.length === 0 &&
+    (phase.expectedTools ?? []).length > 0 &&
+    matchedCalls.length === 0 &&
+    !hasReusableConclusionEvidence &&
+    !hasReusableComparisonEvidence;
+
+  return {
+    satisfied: missingExpectedCalls.length === 0 && !missingGenericToolEvidence,
+    matchedCalls,
+    missingExpectedCalls,
+    missingGenericToolEvidence,
+  };
+}
+
 export function findBestPhaseForExpectedCallGap(
   plan: AnalysisPlanV3,
   record: ToolCallRecord,
+  mode: 'structured_only' | 'structured_or_generic',
 ): PlanPhase | undefined {
   const toolCallLog = Array.isArray(plan.toolCallLog) ? plan.toolCallLog : [];
-  const phasesWithMatchingGap = plan.phases.filter(phase => {
+  const phasesWithStructuredGap = plan.phases.filter(phase => {
     if (phase.status === 'skipped') return false;
     const missingExpectedCalls = findMissingExpectedCallsForPhase(phase, toolCallLog);
     return missingExpectedCalls.some(call => expectedCallMatchesRecord(call, record));
   });
+  const phasesWithMatchingGap = phasesWithStructuredGap.length > 0 || mode === 'structured_only'
+    ? phasesWithStructuredGap
+    : plan.phases.filter(phase => {
+        if (phase.status === 'skipped' || !phaseMatchesCall(phase, record)) return false;
+        return !toolCallLog.some(call =>
+          call.matchedPhaseId === phase.id && phaseMatchesCall(phase, call),
+        );
+      });
   if (phasesWithMatchingGap.length === 0) return undefined;
 
   const statusPriority: Record<PlanPhase['status'], number> = {
@@ -289,11 +412,13 @@ export function findBestPhaseForExpectedCallGap(
     pending: 2,
     skipped: 3,
   };
-  return [...phasesWithMatchingGap].sort((a, b) => {
-    const statusDelta = statusPriority[a.status] - statusPriority[b.status];
-    if (statusDelta !== 0) return statusDelta;
-    return plan.phases.indexOf(a) - plan.phases.indexOf(b);
-  })[0];
+  const highestPriority = Math.min(
+    ...phasesWithMatchingGap.map(phase => statusPriority[phase.status]),
+  );
+  const highestPriorityMatches = phasesWithMatchingGap.filter(
+    phase => statusPriority[phase.status] === highestPriority,
+  );
+  return highestPriorityMatches.length === 1 ? highestPriorityMatches[0] : undefined;
 }
 
 export function findCompletedPhaseEvidenceGaps(plan: AnalysisPlanV3): PlanEvidenceGap[] {
@@ -301,18 +426,28 @@ export function findCompletedPhaseEvidenceGaps(plan: AnalysisPlanV3): PlanEviden
   const toolCallLog = Array.isArray(plan.toolCallLog) ? plan.toolCallLog : [];
   for (const phase of plan.phases) {
     if (phase.status !== 'completed') continue;
-    const matchedCalls = toolCallLog.filter(call => call.matchedPhaseId === phase.id);
-    const missingExpectedCalls = findMissingExpectedCallsForPhase(phase, toolCallLog);
-    if (missingExpectedCalls.length > 0) {
-      gaps.push({ phase, matchedCalls, missingExpectedCalls });
+    const status = getPhaseToolEvidenceStatus(plan, phase, toolCallLog);
+    if (!status.satisfied) {
+      gaps.push({
+        phase,
+        matchedCalls: status.matchedCalls,
+        missingExpectedCalls: status.missingExpectedCalls,
+        ...(status.missingGenericToolEvidence ? {missingGenericToolEvidence: true} : {}),
+      });
     }
   }
   return gaps;
 }
 
 export function formatPlanEvidenceGap(gap: PlanEvidenceGap, outputLanguage: string = 'zh-CN'): string {
-  const missing = gap.missingExpectedCalls.map(formatExpectedCall).join(', ');
   const expected = expectedToolNames(gap.phase).join(', ');
+  if (gap.missingGenericToolEvidence) {
+    if (outputLanguage === 'en') {
+      return `Phase "${gap.phase.name}" (${gap.phase.id}) has no matching tool evidence; run one of: ${expected}`;
+    }
+    return `阶段 "${gap.phase.name}" (${gap.phase.id}) 没有匹配的工具证据；请至少执行以下工具之一: ${expected}`;
+  }
+  const missing = gap.missingExpectedCalls.map(formatExpectedCall).join(', ');
   if (outputLanguage === 'en') {
     return `Phase "${gap.phase.name}" (${gap.phase.id}) is missing required structured calls: ${missing}; expected: ${expected}`;
   }

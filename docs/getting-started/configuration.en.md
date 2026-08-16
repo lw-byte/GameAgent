@@ -4,6 +4,10 @@
 
 For local source runs, SmartPerfetto can use Claude Code's local authentication and configuration directly. If `claude` already works in the same terminal, you do not need to create `.env`. Use env files when you need explicit API keys, compatible proxies, or Docker runtime credentials.
 
+Windows portable users should complete download, extraction, and startup through the
+[Windows guide](windows.en.md), then use the Provider fields on this page. Do not copy Unix
+source commands into the ordinary Windows portable path.
+
 ## First Answer: Which Runtime Do I Configure?
 
 Claude Code, OpenAI Agents SDK, Pi Agent Core, OpenCode, and Qoder Agent SDK are alternative runtime paths, not a checklist of required setup steps. Pick one source for your first setup:
@@ -32,7 +36,7 @@ files below, or from Provider Manager profiles created in the frontend.
 
 For beginners, the UI path is the least ambiguous:
 
-1. Start SmartPerfetto and open `http://localhost:10000`.
+1. Start SmartPerfetto; portable packages use the actual `Open:` URL printed by the launcher, while Docker defaults to `http://localhost:10000`.
 2. Open **AI Assistant Settings → Providers → Add Provider**.
 3. Choose the provider type, paste the **Provider API Key**, then check the preset Base URLs and SDK Runtime.
 4. Click **Create Provider**. This only saves the profile.
@@ -234,11 +238,22 @@ SMARTPERFETTO_PI_AGENT_CORE_MODEL_JSON='{"id":"your-model-id","name":"Your Model
 ```
 
 `SMARTPERFETTO_PI_AGENT_CORE_MODEL_JSON` should use the
-`@earendil-works/pi-ai` Model object shape. `apiKey`, `apiKeyEnv`, `transport`,
+`@earendil-works/pi-ai` Model object shape. SmartPerfetto creates private Pi
+`Models`, provider, and credential-store state for each runtime instance and
+passes `models.streamSimple.bind(models)` explicitly to `Agent`; it does not set
+a process-global default stream function. `apiKey`, `apiKeyEnv`, `credential`, `transport`,
 `thinkingLevel`, `thinkingBudgets`, and `maxRetryDelayMs` may live in the same
-JSON as SmartPerfetto runtime options; `apiKey` is stripped before the model is
-passed into Pi Agent Core state so it does not enter snapshots or reports. The
-real model path uses SmartPerfetto's shared prompt, SQL/Skill,
+JSON as SmartPerfetto runtime options; `apiKey` and `credential` are stripped
+before the model is passed into Pi Agent Core state so they do not enter
+snapshots or reports. Authentication precedence is JSON `credential` or
+`apiKey`, JSON `apiKeyEnv`, the current Provider Manager runtime's isolated
+environment, then the Pi provider's conventional environment variables. OAuth
+uses `credential:{"type":"oauth","refresh":"...","access":"...","expires":...}`
+and is accepted only for a Pi built-in provider that declares OAuth support.
+SmartPerfetto does not start an interactive login during an analysis request;
+near-expiry credentials are refreshed serially through that provider's Pi OAuth
+contract in the instance-private credential store. The real model path uses
+SmartPerfetto's shared prompt, SQL/Skill,
 planning/hypothesis, and report/claim-verification pipeline.
 `SMARTPERFETTO_PI_AGENT_CORE_FAKE_STREAM=1` is smoke/test-only and does not
 represent real analysis quality.
@@ -247,6 +262,23 @@ The `openai-responses` example above targets the official OpenAI Responses API.
 For OpenAI-compatible gateways that only expose chat/completions, set
 `"api":"openai-completions"` in the JSON and use that gateway's `baseUrl`, model
 id, and key.
+Unknown APIs fail before Agent construction. The supported Pi text APIs are
+`anthropic-messages`, `azure-openai-responses`, `bedrock-converse-stream`,
+`google-generative-ai`, `google-vertex`, `mistral-conversations`,
+`openai-codex-responses`, `openai-completions`, `openai-responses`, and
+`pi-messages`.
+For a managed custom provider, place provider-specific values such as
+`DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `AWS_*`, `GOOGLE_*`, or
+`AZURE_OPENAI_*` in that profile's custom environment overrides. SmartPerfetto
+clears credentials from other profiles before constructing the runtime and
+passes only the selected runtime's provider-scoped cloud environment to Pi.
+To prevent the AWS SDK default credential chain from re-reading process-wide
+state, Bedrock accepts only a runtime-scoped `AWS_BEARER_TOKEN_BEDROCK`, or
+explicit `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` credentials (optionally
+with `AWS_SESSION_TOKEN`). `AWS_PROFILE`, ECS container credentials, web
+identity, and shared config/credentials files fail closed. Vertex service
+accounts check only the exact file explicitly selected through
+`GOOGLE_APPLICATION_CREDENTIALS`; SmartPerfetto does not probe user-home ADC.
 
 Pi Agent Core is custom-only in Provider Manager. Removing the custom provider
 or switching `SMARTPERFETTO_AGENT_RUNTIME` back to `claude-agent-sdk` /
@@ -369,15 +401,35 @@ and LLM Skill steps. Blocked responses include `code: "AI_DISABLED"` and
 Slow or local models usually need longer per-turn timeouts:
 
 ```bash
+AGENT_FULL_REQUEST_TIMEOUT_MS=1200000
+AGENT_STREAM_IDLE_TIMEOUT_MS=300000
+AGENT_MAX_HISTORY_BYTES=4194304
+
 CLAUDE_FULL_PER_TURN_MS=60000
+CLAUDE_FULL_REQUEST_TIMEOUT_MS=1200000
+CLAUDE_STREAM_IDLE_TIMEOUT_MS=300000
 CLAUDE_QUICK_PER_TURN_MS=40000
 CLAUDE_VERIFIER_TIMEOUT_MS=60000
 CLAUDE_CLASSIFIER_TIMEOUT_MS=30000
 
 OPENAI_FULL_PER_TURN_MS=60000
+OPENAI_FULL_REQUEST_TIMEOUT_MS=1200000
+OPENAI_STREAM_IDLE_TIMEOUT_MS=300000
+OPENAI_MAX_HISTORY_BYTES=4194304
 OPENAI_QUICK_PER_TURN_MS=40000
 OPENAI_CLASSIFIER_TIMEOUT_MS=30000
 ```
+
+The shared `AGENT_*` safety limits apply to active Provider profiles;
+runtime-specific values can override them on direct environment-provider paths.
+`*_FULL_REQUEST_TIMEOUT_MS` is the absolute wall-clock cap for a full analysis
+(20 minutes by default), even when `maxTurns × per-turn timeout` is larger.
+`*_STREAM_IDLE_TIMEOUT_MS` limits how long a provider may emit no stream events
+(5 minutes by default); on expiry the backend cancels the SDK and active tool
+work, then completes the normal terminal event path with a `partial` result.
+`AGENT_MAX_HISTORY_BYTES` / `OPENAI_MAX_HISTORY_BYTES` default to 4 MiB and only bound provider history
+retained across continuations or sessions. It does not truncate Artifacts,
+DataEnvelopes, reports, or evidence provenance.
 
 | Mode | Behavior | Use case |
 |---|---|---|
@@ -400,6 +452,8 @@ NODE_ENV=development
 # SMARTPERFETTO_BACKEND_PUBLIC_URL=http://localhost:3000
 # Optional HTTPS issue-new endpoint for a self-hosted fork; never auto-submits.
 # SMARTPERFETTO_EXTERNAL_ISSUE_URL=https://github.example.com/org/repo/issues/new
+# Only when an operator confirms RFC 2544 fake-IP DNS from a local TUN:
+# SMARTPERFETTO_TRACE_URL_TRUSTED_FAKE_IP_HOSTS=storage.googleapis.com
 ```
 
 Default local ports:
@@ -415,6 +469,13 @@ derive the local `FRONTEND_URL` from that port, so it does not need to be
 configured twice. Set `FRONTEND_URL` only when the browser-visible frontend
 origin differs, such as HTTPS or a reverse proxy. When the browser cannot infer
 the backend address, set `SMARTPERFETTO_BACKEND_PUBLIC_URL`.
+
+URL Trace downloads reject private, reserved, and RFC 2544 `198.18.0.0/15`
+addresses by default. If a local TUN maps a trusted public hostname to fake IP,
+the deployment operator may list exact comma-separated hostnames in
+`SMARTPERFETTO_TRACE_URL_TRUSTED_FAKE_IP_HOSTS`. Do not use wildcards, IPs, or
+domains you do not control. This is a server-side SSRF trust boundary and
+cannot be widened by an ordinary request.
 
 ## API Authentication
 

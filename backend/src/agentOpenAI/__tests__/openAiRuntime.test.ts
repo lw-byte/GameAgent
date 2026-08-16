@@ -3,7 +3,7 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import { afterEach, describe, expect, it, jest } from '@jest/globals';
-import { OpenAIChatCompletionsModel, withTrace } from '@openai/agents';
+import { OpenAIChatCompletionsModel, Runner, withTrace } from '@openai/agents';
 import { OpenAIRuntime, __testing } from '../openAiRuntime';
 import type { AnalysisPlanV3, PlanPhase } from '../../agentv3/types';
 import type { OpenAIAgentConfig } from '../../agentRuntime/engines/openai/openAiConfig';
@@ -11,6 +11,7 @@ import * as patternMemory from '../../agentv3/analysisPatternMemory';
 import { createAnalysisRunSpec } from '../../agentRuntime/analysisRunSpec';
 import type { QueryResult, TraceProcessorService } from '../../services/traceProcessorService';
 import {getSourceLookupCodeReferences} from '../../services/codebase/sourceLookupTools';
+import {assessFinalReportContractCompleteness} from '../../services/finalReportContractGate';
 
 afterEach(() => {
   jest.restoreAllMocks();
@@ -35,7 +36,21 @@ function plan(phases: PlanPhase[]): AnalysisPlanV3 {
     phases,
     successCriteria: 'Complete every phase before final answer',
     submittedAt: Date.now(),
-    toolCallLog: [],
+    toolCallLog: phases.flatMap((phase, index) => {
+      if (
+        phase.status !== 'completed' ||
+        (phase.expectedCalls ?? []).length > 0 ||
+        (phase.expectedTools ?? []).length === 0
+      ) {
+        return [];
+      }
+      return [{
+        toolName: phase.expectedTools[0],
+        timestamp: index + 1,
+        success: true,
+        matchedPhaseId: phase.id,
+      }];
+    }),
   };
 }
 
@@ -174,7 +189,12 @@ type OpenAiRuntimeTestAccess = {
     sessionId: string,
     handle: {readonly aborted: boolean; abort(): void},
   ) => () => void;
-  sessionPlans: Map<string, { current: AnalysisPlanV3 | null; history: AnalysisPlanV3[] }>;
+  resetAnalysisSessionState: (sessionId: string) => unknown;
+  sessionPlans: Map<string, {
+    current: AnalysisPlanV3 | null;
+    history: AnalysisPlanV3[];
+    prePlanToolCallLog?: AnalysisPlanV3['toolCallLog'];
+  }>;
   sessionSqlErrors: Set<string>;
   sessionMap: Map<string, OpenAiSessionMapEntryForTest>;
 };
@@ -207,6 +227,9 @@ function createOpenAiConfigForTest(): OpenAIAgentConfig {
     protocol: 'responses',
     cwd: process.cwd(),
     fullPathPerTurnMs: 60_000,
+    fullRequestTimeoutMs: 20 * 60_000,
+    streamIdleTimeoutMs: 5 * 60_000,
+    maxHistoryBytes: 4 * 1024 * 1024,
     quickPathPerTurnMs: 30_000,
     classifierTimeoutMs: 10_000,
     outputLanguage: 'zh-CN',
@@ -1158,6 +1181,23 @@ describe('OpenAIRuntime quick mode classification metadata', () => {
 });
 
 describe('OpenAIRuntime plan completion guard', () => {
+  it('drops unfinished pre-plan evidence when a new analysis run starts', () => {
+    const runtime = createOpenAiRuntimeForTest();
+    runtime.sessionPlans.set('s-stale-pre-plan', {
+      current: null,
+      history: [],
+      prePlanToolCallLog: [{
+        toolName: 'get_comparison_context',
+        timestamp: 10,
+        success: true,
+      }],
+    });
+
+    runtime.resetAnalysisSessionState('s-stale-pre-plan');
+
+    expect(runtime.sessionPlans.get('s-stale-pre-plan')?.prePlanToolCallLog).toEqual([]);
+  });
+
   it('treats full-mode runs as incomplete until every plan phase is closed', () => {
     const runtime = createOpenAiRuntimeForTest();
 
@@ -1618,6 +1658,7 @@ describe('OpenAIRuntime plan completion guard', () => {
       }));
     expect(getSourceLookupCodeReferences(currentPlan)).toEqual([{
       chunkId: 'source-1',
+      codebaseId: 'codebase-a',
       filePath: 'app/src/main/java/com/example/StartupHooks.kt',
       lineRange: {start: 10, end: 20},
     }]);
@@ -2017,6 +2058,73 @@ describe('OpenAIRuntime plan completion guard', () => {
     })).toBe(true);
   });
 
+  it('requests final-report continuation when a deliverable report violates a semantic quality boundary', () => {
+    const runtime = createOpenAiRuntimeForTest();
+    const planStatus = {complete: true, hasPlan: true, pendingPhases: []};
+    const report = startupFinalReportForReconciliation();
+
+    expect(runtime.shouldRequestFinalReportAfterPlanComplete({
+      quickMode: false,
+      planStatus,
+      conclusion: `${report}\n\n## 已排除因素\n\nblocked_function=do_epoll_wait 命中 120ms，说明主线程在磁盘 IO 阻塞，所以这是 IO 根因。`,
+      completedByPlanIdle: false,
+      timedOut: false,
+      finalReportContinuations: 0,
+      query: '分析启动性能',
+      sceneType: 'startup',
+    })).toBe(true);
+
+    expect(runtime.shouldRequestFinalReportAfterPlanComplete({
+      quickMode: false,
+      planStatus,
+      conclusion: `${report}\n\n## 已排除因素\n\nblocked_function=do_epoll_wait 通常表示等待事件或空闲，不是磁盘 IO 根因。`,
+      completedByPlanIdle: false,
+      timedOut: false,
+      finalReportContinuations: 0,
+      query: '分析启动性能',
+      sceneType: 'startup',
+    })).toBe(false);
+  });
+
+  it('requests a bounded continuation when a complete report has a CRITICAL recommendation without local evidence', () => {
+    const runtime = createOpenAiRuntimeForTest();
+    const planStatus = {complete: true, hasPlan: true, pendingPhases: []};
+    const report = `${startupFinalReportForReconciliation()}\n\n` + [
+      '## 优化建议',
+      '',
+      '1. **[CRITICAL] `ChaosTask` 移出主线程启动路径**',
+      '- 建议改为异步执行。',
+    ].join('\n');
+    const reportWithEvidence = report.replace(
+      '- 建议改为异步执行。',
+      '- 当前 `ChaosTask` self=456ms，证据引用 art-10；建议改为异步执行。',
+    );
+    const input = {
+      quickMode: false,
+      planStatus,
+      completedByPlanIdle: false,
+      timedOut: false,
+      query: '分析启动性能',
+      sceneType: 'startup' as const,
+    };
+
+    expect(runtime.shouldRequestFinalReportAfterPlanComplete({
+      ...input,
+      conclusion: report,
+      finalReportContinuations: 0,
+    })).toBe(true);
+    expect(runtime.shouldRequestFinalReportAfterPlanComplete({
+      ...input,
+      conclusion: reportWithEvidence,
+      finalReportContinuations: 0,
+    })).toBe(false);
+    expect(runtime.shouldRequestFinalReportAfterPlanComplete({
+      ...input,
+      conclusion: report,
+      finalReportContinuations: 4,
+    })).toBe(false);
+  });
+
   it('requests final-report continuation when a successful source lookup lacks a locatable CodeRef', () => {
     const runtime = createOpenAiRuntimeForTest();
     const completedPlan = plan([phase('p1', 'completed'), phase('p2', 'completed')]);
@@ -2216,7 +2324,15 @@ describe('OpenAIRuntime plan completion guard', () => {
   it('uses a full-report continuation prompt that preserves scene-specific sections', () => {
     const runtime = createOpenAiRuntimeForTest();
 
-    const zhPrompt = runtime.buildFinalReportAfterPlanCompletePrompt('zh-CN', true);
+    const zhPrompt = runtime.buildFinalReportAfterPlanCompletePrompt({
+      outputLanguage: 'zh-CN',
+      requireCodeReference: true,
+      qualityIssue: {
+        code: 'kernel_blocking_claim_boundary',
+        message: 'D/DK 只能说明不可中断等待；没有同窗口 I/O 证据时不能归因为磁盘 I/O。',
+        offendingStatement: 'D 状态证明磁盘 IO 是根因。',
+      },
+    });
     expect(zhPrompt).toContain('继续遵守本轮场景策略');
     expect(zhPrompt).toContain('Final Report Contract');
     expect(zhPrompt).toContain('场景契约要求的结构');
@@ -2226,10 +2342,30 @@ describe('OpenAIRuntime plan completion guard', () => {
     expect(zhPrompt).toContain('relative/path/File.kt:L10-L20');
     expect(zhPrompt).toContain('版本/政策敏感');
     expect(zhPrompt).toContain('缺失数据只能写成限制');
+    expect(zhPrompt).toContain('`epoll` / `poll`');
+    expect(zhPrompt).toContain('kernel wchan 单帧');
+    expect(zhPrompt).toContain('D/DK/Q4a');
+    expect(zhPrompt).toContain('不可中断等待');
+    expect(zhPrompt).toContain('标题、表格分类或已排除因素');
+    expect(zhPrompt).toContain('无法归因 I/O');
+    expect(zhPrompt).toContain('同一线程和等待窗口');
+    expect(zhPrompt).toContain('每个 `[CRITICAL]`');
+    expect(zhPrompt).toContain('不能只把它降为 `[HIGH]`');
+    expect(zhPrompt).toContain('本次补写还必须修正以下质量门禁问题');
+    expect(zhPrompt).toContain('D/DK 只能说明不可中断等待；没有同窗口 I/O 证据时不能归因为磁盘 I/O。');
+    expect(zhPrompt).toContain('D 状态证明磁盘 IO 是根因。');
+    expect(zhPrompt).not.toContain('{{quality_issue}}');
     expect(zhPrompt).not.toContain('2500-3500');
     expect(zhPrompt).not.toContain('最多 1200');
 
-    const enPrompt = runtime.buildFinalReportAfterPlanCompletePrompt('en');
+    const enPrompt = runtime.buildFinalReportAfterPlanCompletePrompt({
+      outputLanguage: 'en',
+      qualityIssue: {
+        code: 'kernel_blocking_claim_boundary',
+        message: 'D/DK only proves uninterruptible wait; do not attribute disk I/O without same-window I/O evidence.',
+        offendingStatement: 'D-state proves disk I/O was the root cause.',
+      },
+    });
     expect(enPrompt).toContain('scene strategy');
     expect(enPrompt).toContain('Final Report Contract');
     expect(enPrompt).toContain('structures required by the scene contract');
@@ -2238,8 +2374,344 @@ describe('OpenAIRuntime plan completion guard', () => {
     expect(enPrompt).toContain('evidence type');
     expect(enPrompt).toContain('version/policy-sensitive');
     expect(enPrompt).toContain('Missing data is a limitation');
+    expect(enPrompt).toContain('`epoll` / `poll`');
+    expect(enPrompt).toContain('single kernel wchan frame');
+    expect(enPrompt).toContain('D/DK/Q4a');
+    expect(enPrompt).toContain('uninterruptible wait');
+    expect(enPrompt).toContain('headings, table categories, or ruled-out factors');
+    expect(enPrompt).toContain('cannot be attributed to I/O');
+    expect(enPrompt).toContain('same thread and wait window');
+    expect(enPrompt).toContain('Every `[CRITICAL]`');
+    expect(enPrompt).toContain('Do not evade this by relabeling it as `[HIGH]`');
+    expect(enPrompt).toContain('correct the quality-gate issue below');
+    expect(enPrompt).toContain('D/DK only proves uninterruptible wait; do not attribute disk I/O without same-window I/O evidence.');
+    expect(enPrompt).toContain('D-state proves disk I/O was the root cause.');
+    expect(enPrompt).not.toContain('{{quality_issue}}');
     expect(enPrompt).not.toContain('1,200-1,800');
     expect(enPrompt).not.toContain('at most 700');
+  });
+
+  it('renders the current report contract gaps in contract order without stale placeholders', () => {
+    const runtime = createOpenAiRuntimeForTest();
+    const incompleteReport = startupFinalReportForReconciliation()
+      .replace('A4 主线程重任务', '主线程重任务');
+    const contractIssue = assessFinalReportContractCompleteness({
+      conclusion: incompleteReport,
+      query: '分析启动性能',
+      sceneType: 'startup',
+    });
+
+    expect(contractIssue?.missingSections.map(section => section.id)).toEqual([
+      'root_cause_references',
+    ]);
+
+    const continuationPrompt = runtime.buildFinalReportAfterPlanCompletePrompt({
+      outputLanguage: 'zh-CN',
+      missingSections: contractIssue?.missingSections,
+      requireCodeReference: true,
+    });
+
+    expect(continuationPrompt).toContain('### 必须补齐的缺失小节');
+    expect(continuationPrompt).toContain('- 根因编号引用: 关键根因只能引用启动知识库已有的 A1-A18、B1-B12');
+    expect(continuationPrompt.indexOf('### 必须补齐的缺失小节'))
+      .toBeLessThan(continuationPrompt.indexOf('relative/path/File.kt:L10-L20'));
+    expect(continuationPrompt).not.toContain('{{missing_sections}}');
+
+    const completeIssue = assessFinalReportContractCompleteness({
+      conclusion: startupFinalReportForReconciliation(),
+      query: '分析启动性能',
+      sceneType: 'startup',
+    });
+    expect(completeIssue).toBeUndefined();
+
+    const nextPrompt = runtime.buildFinalReportAfterPlanCompletePrompt({
+      outputLanguage: 'zh-CN',
+      missingSections: completeIssue?.missingSections,
+    });
+    expect(nextPrompt).not.toContain('### 必须补齐的缺失小节');
+  });
+
+  it('renders every English contract gap and no unresolved template variables', () => {
+    const runtime = createOpenAiRuntimeForTest();
+    const missingSections = [
+      {
+        id: 'root_cause_references',
+        label: 'Root-cause references',
+        description: 'Use only evidence-backed A/B/SR identifiers.',
+        recoveryText: {zh: [], en: []},
+      },
+      {
+        id: 'audience_recommendations',
+        label: 'App/System recommendations',
+        description: 'Separate app and platform actions.',
+        recoveryText: {zh: [], en: []},
+      },
+    ];
+
+    const prompt = runtime.buildFinalReportAfterPlanCompletePrompt({
+      outputLanguage: 'en',
+      missingSections,
+    });
+
+    expect(prompt).toContain('### Required Missing Sections');
+    expect(prompt).toContain('- Root-cause references: Use only evidence-backed A/B/SR identifiers.');
+    expect(prompt).toContain('- App/System recommendations: Separate app and platform actions.');
+    expect(prompt.indexOf('Root-cause references')).toBeLessThan(prompt.indexOf('App/System recommendations'));
+    expect(prompt).not.toContain('{{missing_sections}}');
+  });
+
+  it('returns a terminal partial result when the provider stalls before creating a stream', async () => {
+    const originalIdleTimeout = process.env.OPENAI_STREAM_IDLE_TIMEOUT_MS;
+    const originalRequestTimeout = process.env.OPENAI_FULL_REQUEST_TIMEOUT_MS;
+    process.env.OPENAI_STREAM_IDLE_TIMEOUT_MS = '15';
+    process.env.OPENAI_FULL_REQUEST_TIMEOUT_MS = '1000';
+
+    const runtime = createOpenAiRuntimeForTest();
+    const updates: OpenAiStreamingUpdateForTest[] = [];
+    runtime.on('update', update => updates.push(update));
+    let providerSignal: AbortSignal | undefined;
+    jest.spyOn(Runner.prototype as any, 'run')
+      .mockImplementation(async (...args: unknown[]) => {
+        const options = args[2] as {signal?: AbortSignal};
+        providerSignal = options.signal;
+        return await new Promise(() => undefined);
+      });
+    jest.spyOn(runtime, 'classifyModeForRequest').mockResolvedValue({
+      quickMode: false,
+      source: 'user_explicit',
+      reason: 'test full mode',
+      skipQuickTracePreflightDetection: false,
+      quickAcknowledgementDirectAnswer: false,
+      quickProcessIdentityPreEvidence: false,
+      quickTraceFactPreEvidence: false,
+      quickScrollingTriagePreEvidence: false,
+    });
+    jest.spyOn(runtime, 'prepareAnalysisContext').mockResolvedValue({
+      tools: [],
+      allowedTools: [],
+      systemPrompt: 'test system prompt',
+      sessionContext: {
+        addTurn: jest.fn(),
+        updateWorkingMemoryFromConclusion: jest.fn(),
+      },
+      previousTurns: [],
+      architecture: {type: 'Standard', confidence: 1, evidence: []},
+      hypotheses: [],
+      sessionMapKey: 's-provider-create-idle-timeout',
+      effectivePackageName: 'com.example.demo',
+    } as any);
+    jest.spyOn(runtime, 'recordPatternMemory').mockImplementation(() => undefined);
+
+    try {
+      const result = await runtime.analyze(
+        '分析启动性能',
+        's-provider-create-idle-timeout',
+        'trace-provider-create-idle-timeout',
+        {analysisMode: 'full', providerId: null},
+      );
+
+      expect(providerSignal?.aborted).toBe(true);
+      expect(result).toMatchObject({
+        success: true,
+        partial: true,
+        terminationReason: 'timeout',
+      });
+      expect(updates).toContainEqual(expect.objectContaining({
+        type: 'degraded',
+        content: expect.objectContaining({
+          fallback: 'partial_result_after_timeout',
+          timeoutKind: 'stream_idle',
+        }),
+      }));
+    } finally {
+      if (originalIdleTimeout === undefined) delete process.env.OPENAI_STREAM_IDLE_TIMEOUT_MS;
+      else process.env.OPENAI_STREAM_IDLE_TIMEOUT_MS = originalIdleTimeout;
+      if (originalRequestTimeout === undefined) delete process.env.OPENAI_FULL_REQUEST_TIMEOUT_MS;
+      else process.env.OPENAI_FULL_REQUEST_TIMEOUT_MS = originalRequestTimeout;
+    }
+  });
+
+  it('recomputes contract gaps for the fresh continuation report and keeps only the second report', async () => {
+    const runtime = createOpenAiRuntimeForTest();
+    const slowReasonPhase = phase('p1', 'completed');
+    slowReasonPhase.name = '冷启动慢原因交叉验证';
+    slowReasonPhase.summary = [
+      'startup_slow_reasons returned reason_id=SR12.',
+      'bindApplication non_fw_percent=98.8%, self_ms=568.8ms, evidence=art-sr12.',
+    ].join(' ');
+    const completedPlan = plan([slowReasonPhase]);
+    completedPlan.toolCallLog.push({
+      toolName: 'invoke_skill',
+      skillId: 'startup_slow_reasons',
+      matchedPhaseId: 'p1',
+      success: true,
+      timestamp: Date.now(),
+    });
+    completedPlan.toolCallLog.push(
+      {
+        toolName: 'invoke_skill',
+        skillId: 'anr_analysis',
+        success: true,
+        timestamp: Date.now() + 1,
+      },
+      {
+        toolName: 'invoke_skill',
+        skillId: 'startup_analysis',
+        success: true,
+        timestamp: Date.now() + 2,
+      },
+    );
+    runtime.sessionPlans.set('s-current-contract-gap', {
+      current: completedPlan,
+      history: [],
+    });
+
+    const initialReport = startupFinalReportForReconciliation()
+      .replace('A4 主线程重任务', 'EARLY_DRAFT_CANARY');
+    const freshReport = startupFinalReportForReconciliation()
+      .replace(
+        'A4 主线程重任务与当前 trace 的 Running 证据一致，证据引用 art-10 和 art-32。',
+        'SR12 交叉验证命中 bindApplication 非框架 Slice：non_fw_percent=98.8%、self_ms=568.8ms，证据引用 art-sr12；它支持排查三方 SDK/应用初始化，但不是合成负载的直接编号映射。',
+      );
+    const inputs: unknown[] = [];
+    const streams = [initialReport, freshReport].map((finalOutput, index) => ({
+      currentTurn: 1,
+      finalOutput,
+      history: [{role: 'assistant', content: finalOutput}],
+      lastResponseId: `resp-${index + 1}`,
+      state: {},
+      completed: Promise.resolve(),
+      async *[Symbol.asyncIterator]() {},
+    }));
+    const runSpy = jest.spyOn(Runner.prototype as any, 'run')
+      .mockImplementation(async (_agent: unknown, input: unknown) => {
+        inputs.push(input);
+        const stream = streams.shift();
+        if (!stream) throw new Error('unexpected third OpenAI prompt');
+        return stream;
+      });
+    jest.spyOn(runtime, 'classifyModeForRequest').mockResolvedValue({
+      quickMode: false,
+      source: 'user_explicit',
+      reason: 'test full mode',
+      skipQuickTracePreflightDetection: false,
+      quickAcknowledgementDirectAnswer: false,
+      quickProcessIdentityPreEvidence: false,
+      quickTraceFactPreEvidence: false,
+      quickScrollingTriagePreEvidence: false,
+    });
+    const addTurn = jest.fn();
+    const updateWorkingMemoryFromConclusion = jest.fn();
+    jest.spyOn(runtime, 'prepareAnalysisContext').mockResolvedValue({
+      tools: [],
+      allowedTools: [],
+      systemPrompt: 'test system prompt',
+      sessionContext: {
+        addTurn,
+        updateWorkingMemoryFromConclusion,
+      },
+      previousTurns: [],
+      architecture: {type: 'Standard', confidence: 1, evidence: []},
+      hypotheses: [],
+      sessionMapKey: 's-current-contract-gap',
+      effectivePackageName: 'com.example.demo',
+    } as any);
+    jest.spyOn(runtime, 'recordPatternMemory').mockImplementation(() => undefined);
+
+    const result = await runtime.analyze(
+      '请调用 anr_analysis 检查这个启动 Trace 是否包含 ANR。',
+      's-current-contract-gap',
+      'trace-current-contract-gap',
+      {analysisMode: 'full', providerId: null},
+    );
+
+    expect(runSpy).toHaveBeenCalledTimes(2);
+    const continuationInput = inputs[1] as Array<{role?: string; content?: string}>;
+    const continuationPrompt = continuationInput[continuationInput.length - 1]?.content ?? '';
+    expect(continuationPrompt).toContain('根因编号引用');
+    expect(continuationPrompt).toContain('关键根因只能引用启动知识库已有的 A1-A18、B1-B12');
+    expect(result.conclusion).toBe(freshReport);
+    expect(result.conclusion).toContain('SR12 交叉验证命中 bindApplication 非框架 Slice');
+    expect(result.conclusion).toContain('non_fw_percent=98.8%');
+    expect(result.conclusion).not.toContain('EARLY_DRAFT_CANARY');
+    expect(result.partial).not.toBe(true);
+    expect(addTurn).toHaveBeenCalledTimes(1);
+    expect(updateWorkingMemoryFromConclusion).toHaveBeenCalledTimes(1);
+  });
+
+  it('continues a complete report once for missing CRITICAL evidence and finishes with the fresh evidenced report', async () => {
+    const runtime = createOpenAiRuntimeForTest();
+    const evidencePhase = phase('p1', 'completed');
+    evidencePhase.name = '启动证据采集';
+    evidencePhase.summary = 'ChaosTask self=456ms，evidence=art-10。';
+    runtime.sessionPlans.set('s-critical-evidence-gap', {
+      current: plan([evidencePhase]),
+      history: [],
+    });
+
+    const reportBase = `${startupFinalReportForReconciliation()}\n\n## 优化建议\n\n`;
+    const initialReport = `${reportBase}1. **[CRITICAL] \`ChaosTask\` 移出主线程启动路径**\n- 建议改为异步执行。`;
+    const freshReport = `${reportBase}1. **[CRITICAL] \`ChaosTask\` 移出主线程启动路径** — 当前 \`ChaosTask\` self=456ms，证据引用 art-10；建议改为异步执行。`;
+    const inputs: unknown[] = [];
+    const streams = [initialReport, freshReport].map((finalOutput, index) => ({
+      currentTurn: 1,
+      finalOutput,
+      history: [{role: 'assistant', content: finalOutput}],
+      lastResponseId: `resp-critical-${index + 1}`,
+      state: {},
+      completed: Promise.resolve(),
+      async *[Symbol.asyncIterator]() {},
+    }));
+    const runSpy = jest.spyOn(Runner.prototype as any, 'run')
+      .mockImplementation(async (_agent: unknown, input: unknown) => {
+        inputs.push(input);
+        const stream = streams.shift();
+        if (!stream) throw new Error('unexpected third OpenAI prompt');
+        return stream;
+      });
+    jest.spyOn(runtime, 'classifyModeForRequest').mockResolvedValue({
+      quickMode: false,
+      source: 'user_explicit',
+      reason: 'test full mode',
+      skipQuickTracePreflightDetection: false,
+      quickAcknowledgementDirectAnswer: false,
+      quickProcessIdentityPreEvidence: false,
+      quickTraceFactPreEvidence: false,
+      quickScrollingTriagePreEvidence: false,
+    });
+    const addTurn = jest.fn();
+    const updateWorkingMemoryFromConclusion = jest.fn();
+    jest.spyOn(runtime, 'prepareAnalysisContext').mockResolvedValue({
+      tools: [],
+      allowedTools: [],
+      systemPrompt: 'test system prompt',
+      sessionContext: {addTurn, updateWorkingMemoryFromConclusion},
+      previousTurns: [],
+      architecture: {type: 'Standard', confidence: 1, evidence: []},
+      hypotheses: [],
+      sessionMapKey: 's-critical-evidence-gap',
+      effectivePackageName: 'com.example.demo',
+    } as any);
+    jest.spyOn(runtime, 'recordPatternMemory').mockImplementation(() => undefined);
+
+    const result = await runtime.analyze(
+      '分析启动性能',
+      's-critical-evidence-gap',
+      'trace-critical-evidence-gap',
+      {analysisMode: 'full', providerId: null},
+    );
+
+    expect(runSpy).toHaveBeenCalledTimes(2);
+    const continuationInput = inputs[1] as Array<{role?: string; content?: string}>;
+    const continuationPrompt = continuationInput[continuationInput.length - 1]?.content ?? '';
+    expect(continuationPrompt).toContain('每个 `[CRITICAL]`');
+    expect(result.conclusion).toBe(freshReport);
+    expect(result.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({severity: 'critical', evidence: expect.any(Array)}),
+    ]));
+    expect(result.partial).not.toBe(true);
+    expect(addTurn).toHaveBeenCalledTimes(1);
+    expect(updateWorkingMemoryFromConclusion).toHaveBeenCalledTimes(1);
   });
 
   it('uses user-facing continuation progress text instead of provider internals', () => {
@@ -2708,6 +3180,26 @@ describe('OpenAIRuntime previous response recovery', () => {
     expect(resolved.input).toBe('continue');
     expect(resolved.previousResponseId).toBe('resp_fresh');
     expect(resolved.shouldPersistRemoteSession).toBe(true);
+  });
+
+  it('does not send oversized retained history into a full-mode continuation', () => {
+    const resolved = __testing.resolveOpenAIRunInput({
+      quickMode: false,
+      config: {
+        ...createOpenAiConfigForTest(),
+        protocol: 'chat_completions',
+        maxHistoryBytes: 256,
+      },
+      sessionEntry: {
+        history: [{role: 'user', content: 'x'.repeat(2_000)}],
+        updatedAt: Date.now(),
+      },
+      effectivePrompt: 'continue from bounded local context',
+      previousTurns: [],
+    });
+
+    expect(resolved.input).toBe('continue from bounded local context');
+    expect(JSON.stringify(resolved)).not.toContain('x'.repeat(256));
   });
 
   it('does not join or persist a remote response chain for private analyses', () => {

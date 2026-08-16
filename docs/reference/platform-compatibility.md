@@ -28,6 +28,12 @@ SmartPerfetto 有四种分发 / runtime 家族；产品内部仍有更多具体�
 任一层缺少证据时，只报告已完成的层级；Windows/Linux 交叉构建不能写成 Windows/Linux
 runtime smoke，Docker host 的操作系统也不能写成 container target。
 
+Windows 用户操作以 [Windows 指南](../getting-started/windows.md) 为准。当前公开 v1.4.0
+的 Windows x64 最终归档已在 Windows Server 2025 runner 验证包内 runtime、health、
+最小 trace processor 查询、退出和端口释放；这不等于 Windows 10/11 桌面、SmartScreen
+或 Provider UI 已人工验收。后续归档门禁还要求实际加载 SQLite/sodium、运行本地 Provider
+生命周期和 Windows DPAPI SecretStore probe；只有对应最终归档执行成功后才能计为证据。
+
 ## 网络绑定边界
 
 Source Web 默认把前后端监听到 IPv4 loopback `127.0.0.1`。若维护者确实需要暴露源码
@@ -40,12 +46,13 @@ publish host 控制，默认仍只发布到宿主 `127.0.0.1`。
 ## 事实所有权
 
 - 安装和首次运行：[快速开始](../getting-started/quick-start.md)
+- Windows 下载、配置、更新与排障：[Windows 指南](../getting-started/windows.md)
 - Node、Provider 和部署配置：[配置指南](../getting-started/configuration.md)
 - npm CLI 平台与 fallback：[CLI](cli.md)
 - portable target、数据目录和迁移：[免安装包](portable-packaging.md)
 - 发布顺序和 published-surface 验收：[发布流程](release.md)
 - Agent/维护者验证门禁：[测试规则](../../.claude/rules/testing.md)
-- UI/CLI 更新提示和各分发更新动作：[应用更新](../../README.zh-CN.md#应用更新)
+- UI/CLI 更新提示和各分发更新动作：[应用更新](../getting-started/application-updates.md)
 
 应用更新检查只报告可用版本和推荐动作，不会替换正在运行的源码、npm 包、Docker
 container 或 portable 目录。
